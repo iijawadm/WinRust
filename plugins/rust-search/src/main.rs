@@ -271,7 +271,8 @@ fn scan(h: HANDLE) -> Result<Index, String> {
         }
         let b = &buf[..n as usize];
         if b.len() < 8 {
-            break;
+            idx.shrink();
+            return Ok(idx);
         }
         med.StartFileReferenceNumber = u64::from_le_bytes(b[..8].try_into().unwrap());
         records(b, |frn, parent, _, name| {
