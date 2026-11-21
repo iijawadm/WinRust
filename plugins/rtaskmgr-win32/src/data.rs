@@ -230,6 +230,7 @@ impl Data {
     }
 
     /// Один такт обновления. Возвращает сообщения от правил (их показывает интерфейс).
+    #[cfg(test)]
     pub fn refresh(&mut self) -> Vec<String> {
         self.refresh_with_visible(true)
     }
