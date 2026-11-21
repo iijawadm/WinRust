@@ -21,6 +21,8 @@ enum Act {
     VolSlide,
     BrightSlide,
     Mute,
+    AudioDrop,        // toggles the audio output dropdown inside Quick Settings
+    AudioDev(usize),  // selects audio output device index from AUDIO_DEVS
     WifiSwitch,
     Tile(u8),
     WifiMore,
@@ -117,6 +119,8 @@ thread_local! {
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started opening
     static JUST: RefCell<(String, u64)> = const { RefCell::new((String::new(), 0)) }; // the app pinned last and when: its row pulses
     static GHOST: Cell<(HWND, u64, (i32, i32))> = const { Cell::new((null_mut(), 0, (0, 0))) }; // the closing flyout: window, start, position
+    static AUDIO_DEVS: RefCell<Vec<crate::audio::Dev>> = const { RefCell::new(Vec::new()) }; // active playback devices shown in Quick Settings dropdown
+    static AUDIO_OPEN: Cell<bool> = const { Cell::new(false) }; // whether the audio output dropdown is expanded
 }
 
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -580,9 +584,18 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 
 // ---------- geometry ----------
 
+/// Extra vertical space inside Quick Settings when the audio output dropdown is expanded.
+fn audio_extra() -> i32 {
+    if !AUDIO_OPEN.get() {
+        return 0;
+    }
+    let n = AUDIO_DEVS.with_borrow(|d| d.len()).clamp(1, 6) as i32;
+    8 + 34 * n
+}
+
 fn size(k: Kind) -> (i32, i32) {
     match k {
-        Kind::Quick => (360, 252 + 44 * sliders()),
+        Kind::Quick => (360, 292 + 44 * sliders() + audio_extra()),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
@@ -664,6 +677,15 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             }
             v.push((r(24, y, 60, y + 40), Act::Mute));
             v.push((r(64, y, w - 24, y + 40), Act::VolSlide));
+            y += 44;
+            v.push((r(24, y, w - 24, y + 36), Act::AudioDrop));
+            if AUDIO_OPEN.get() {
+                let n = AUDIO_DEVS.with_borrow(|d| d.len()).min(6);
+                for i in 0..n {
+                    let top = y + 42 + 34 * i as i32;
+                    v.push((r(24, top, w - 24, top + 34), Act::AudioDev(i)));
+                }
+            }
             v.push((r(w - 54, h - 50, w - 14, h - 10), Act::Settings("ms-settings:")));
             v
         }
@@ -897,6 +919,9 @@ pub fn toggle(k: Kind) {
                 read_nets();
             }
             Kind::Quick => {
+                AUDIO_OPEN.set(false);
+                AUDIO_DEVS.set(crate::audio::outputs());
+                crate::reset_audio_endpoint();
                 read_brightness();
                 read_nets();
                 crate::quick::refresh();
@@ -1004,6 +1029,19 @@ unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
     close();
 }
 
+unsafe fn resize_fly(k: Kind) {
+    let hw = FH.get();
+    if hw.is_null() {
+        return;
+    }
+    let (w, h) = (sc(size(k).0), sc(size(k).1));
+    let (x, _) = FIN.get();
+    let y = pop_y(h);
+    FIN.set((x, y));
+    SetWindowPos(hw, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowRgn(hw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(16), rr(16)), 1);
+}
+
 unsafe fn run_act(a: Act, rect: RECT, x: i32) {
     match a {
         Act::VolSlide | Act::BrightSlide => {
@@ -1051,6 +1089,25 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             _ => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
         },
         Act::Mute => toggle_mute(),
+        Act::AudioDrop => {
+            let open = !AUDIO_OPEN.get();
+            if open {
+                AUDIO_DEVS.set(crate::audio::outputs());
+            }
+            AUDIO_OPEN.set(open);
+            resize_fly(Kind::Quick);
+        }
+        Act::AudioDev(i) => {
+            let id = AUDIO_DEVS.with_borrow(|d| d.get(i).map(|x| x.id.clone()));
+            if let Some(id) = id {
+                if crate::audio::set_default(&id) {
+                    crate::reset_audio_endpoint();
+                }
+            }
+            AUDIO_DEVS.set(crate::audio::outputs());
+            AUDIO_OPEN.set(false);
+            resize_fly(Kind::Quick);
+        }
         Act::Menu(i) => {
             close();
             if let Some(pick) = MPICK.take() {
@@ -1270,9 +1327,9 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     text(dc, sub, r(tl + 12, tt + 61, tl + 100, tt + 75), pal().dim, DT_LEFT);
                 }
             }
-            // sliders sit together on one card
+            // sliders and audio output dropdown sit together on one card
             let n = sliders();
-            surface(dc, r(16, 184, w - 16, 192 + 44 * n), card, sc(18));
+            surface(dc, r(16, 184, w - 16, 192 + 44 * n + 40 + audio_extra()), card, sc(18));
             let mut y = 188;
             let b = BRIGHT.load(Relaxed);
             if b >= 0 {
@@ -1285,6 +1342,40 @@ unsafe fn paint(hw: HWND, k: Kind) {
             SelectObject(dc, f_glyph);
             text(dc, if muted || vol == 0 { "\u{E74F}" } else { "\u{E767}" }, r(24, y, 60, y + 40), if muted { BAD } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
             track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted { 0.0 } else { vol.max(0) as f32 / 100.0 });
+            y += 44;
+            // clickable audio output selector bar (expands inline dropdown list of active playback devices)
+            let drop_open = AUDIO_OPEN.get();
+            let drop_rc = r(24, y, w - 24, y + 36);
+            let drop_base = if drop_open { mix(card, pal().accent, 0.12) } else { card };
+            g(Act::AudioDrop, drop_rc, drop_base, mix(drop_base, pal().text, 0.08), sc(10));
+            SelectObject(dc, f_glyph);
+            text(dc, "\u{E7F6}", r(26, y, 56, y + 36), if drop_open { pal().accent } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
+            AUDIO_DEVS.with_borrow(|devs| {
+                SelectObject(dc, f_label);
+                text(dc, crate::audio::active_name(devs), r(60, y, w - 54, y + 36), pal().text, DT_LEFT);
+                SelectObject(dc, f_gs);
+                text(dc, if drop_open { "\u{E70E}" } else { "\u{E70D}" }, r(w - 52, y, w - 26, y + 36), pal().dim, DT_CENTER);
+                if drop_open {
+                    fill(dc, r(28, y + 39, w - 28, y + 40), pal().line, 0);
+                    if devs.is_empty() {
+                        SelectObject(dc, f_small);
+                        text(dc, t!("Нет устройств вывода", "No output devices"), r(32, y + 42, w - 32, y + 76), pal().dim, DT_LEFT);
+                    } else {
+                        for (i, d) in devs.iter().take(6).enumerate() {
+                            let top = y + 42 + 34 * i as i32;
+                            let row = r(24, top, w - 24, top + 34);
+                            let base = if d.default { mix(card, pal().accent, 0.14) } else { card };
+                            g(Act::AudioDev(i), row, base, mix(base, pal().text, 0.08), sc(8));
+                            SelectObject(dc, f_label);
+                            text(dc, &d.name, r(36, top, w - 54, top + 34), if d.default { pal().accent } else { pal().text }, DT_LEFT);
+                            if d.default {
+                                SelectObject(dc, f_gs);
+                                text(dc, "\u{E73E}", r(w - 50, top, w - 28, top + 34), pal().accent, DT_CENTER);
+                            }
+                        }
+                    }
+                }
+            });
             // footer: the battery in a pill, the settings gear in a circle
             let (pct, ac) = BAT.get();
             if pct >= 0 {

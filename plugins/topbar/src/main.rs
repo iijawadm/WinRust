@@ -19,6 +19,7 @@ use std::{
 extern crate winrust_common;
 use winrust_common as i18n;
 use winrust_common::style::{Style, card, on_accent, pal, rgb, style, ui_face};
+mod audio;
 mod clip;
 mod fly;
 mod quick;
@@ -1103,6 +1104,16 @@ unsafe fn read_volume() {
         EP.set(None); // device changed: look the endpoint up again next time
     }
     VOL.set(v.unwrap_or((-1, false)));
+}
+
+/// Drops the cached audio endpoint so volume controls immediately bind to the newly selected default playback device.
+pub(crate) unsafe fn reset_audio_endpoint() {
+    EP.set(None);
+    read_volume();
+    let bar = BAR.load(Relaxed) as HWND;
+    if !bar.is_null() {
+        InvalidateRect(bar, null(), 0);
+    }
 }
 
 unsafe fn set_volume(v: i32) {
@@ -2659,6 +2670,34 @@ unsafe fn tile_windows() {
     TileWindows(null_mut(), MDITILE_VERTICAL, &wa, wins.len() as u32, wins.as_ptr());
 }
 
+/// Instant audio output device dropdown menu (right click on the taskbar speaker icon).
+unsafe fn audio_menu() {
+    let bar = BAR.load(Relaxed) as HWND;
+    let devs = audio::outputs();
+    let mut items: Vec<fly::MItem> = if devs.is_empty() {
+        vec![fly::MItem::new(t!("Нет устройств вывода", "No output devices"))]
+    } else {
+        devs.iter().map(|d| fly::MItem::new(d.name.clone()).on(d.default)).collect()
+    };
+    let settings_idx = items.len();
+    items.push(fly::MItem::new(t!("Параметры звука…", "Sound settings…")).sep());
+    let head = (
+        null_mut(),
+        "\u{E7F6}",
+        t!("Вывод звука", "Audio output").to_string(),
+        t!("Выберите устройство воспроизведения", "Choose playback device").to_string(),
+    );
+    fly::menu(tip_cx(&bar_layout(bar), VOL_I), Some(head), items, move |i| {
+        if i == settings_idx {
+            open(&wide("ms-settings:sound"));
+        } else if let Some(d) = devs.get(i) {
+            if audio::set_default(&d.id) {
+                reset_audio_endpoint();
+            }
+        }
+    });
+}
+
 unsafe fn click(h: i32, left: bool, mid: bool) {
     match h {
         SEARCH if left => {
@@ -2675,6 +2714,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         LANG if left => lang_menu(BAR.load(Relaxed) as HWND),
         LANG => next_lang(BAR.load(Relaxed) as HWND),
         WIFI_I => fly::toggle(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
+        VOL_I if !left && !mid => audio_menu(), // right click on speaker: instant audio output selector
         VOL_I | BAT_I => fly::toggle(fly::Kind::Quick),
         CLOCK if left => fly::toggle(fly::Kind::Cal),
         GEAR => style_menu(),
