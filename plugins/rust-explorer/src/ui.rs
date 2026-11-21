@@ -4,7 +4,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::*;
 use std::{cell::Cell, collections::HashMap, path::Path};
-use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{FreeLibrary, GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
+use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
 
 // The colours come from the WinRust style the topbar gear picks (normal, terminal, dock, tiling): the same palette as the bar.
 pub use winrust_common::style::{pal, ui_face};
