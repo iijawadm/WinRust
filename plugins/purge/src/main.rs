@@ -2,6 +2,7 @@
 // purge --apply      REMOVE it, for good (admin). There is no undo: only a log of what went is kept
 // purge --ask        list, then ask to type YES before removing (what the topbar menu starts, in its own window)
 // purge --onedrive   (with --apply) also uninstall OneDrive      purge --edge   (with --apply) also try to uninstall Edge
+// purge --keep-xbox  keep Xbox PC app and Game Bar overlays (recommended for PC Game Pass and Ryzen X3D dual-CCD CPUs)
 //
 // What Tiny11 cuts out of the image, done on a running system: bundled Store apps (installed and provisioned, so new
 // users do not get them back) and the telemetry scheduled tasks. Never touched: the Store, Settings, the shell hosts,
@@ -44,13 +45,30 @@ const TASKS: &[&str] = &[
     r"\Microsoft\Windows\Windows Error Reporting\QueueReporting",
 ];
 
+/// Xbox / Game Bar apps preserved when `--keep-xbox` is passed.
+const XBOX_APPS: &[&str] = &[
+    "Microsoft.GamingApp",
+    "Microsoft.XboxGameOverlay",
+    "Microsoft.XboxGamingOverlay",
+    "Microsoft.XboxSpeechToTextOverlay",
+    "Microsoft.Xbox.TCUI",
+];
+
 fn starts(name: &str, list: &[&str]) -> bool {
     let n = name.to_lowercase();
     list.iter().any(|p| n.starts_with(&p.to_lowercase()))
 }
 
 /// Removable junk. "Microsoft.Windows." is protected as a whole, except the few items that are JUNK by their full name.
+#[cfg(test)]
 fn is_junk(name: &str) -> bool {
+    is_junk_with_opts(name, false)
+}
+
+fn is_junk_with_opts(name: &str, keep_xbox: bool) -> bool {
+    if keep_xbox && starts(name, XBOX_APPS) {
+        return false;
+    }
     let keep = starts(name, PROTECTED) && !starts(name, &["Microsoft.Windows.Ai.Copilot.Provider", "Microsoft.Windows.DevHome", "MicrosoftWindows.Client.WebExperience"]);
     let n = name.to_lowercase();
     !keep && JUNK.iter().any(|p| n.starts_with(&p.to_lowercase()) || (p.len() >= 5 && !p.contains('.') && n.contains(&p.to_lowercase())))
@@ -73,7 +91,12 @@ fn ps(script: &str) -> (bool, String) {
 }
 
 /// `appx|FullName|Name|NonRemovable` and `prov|PackageName|DisplayName` lines of the listing script.
+#[cfg(test)]
 fn parse(out: &str) -> Vec<Item> {
+    parse_with_opts(out, false)
+}
+
+fn parse_with_opts(out: &str, keep_xbox: bool) -> Vec<Item> {
     let mut v = vec![];
     for l in out.lines().map(str::trim) {
         let f: Vec<&str> = l.split('|').collect();
@@ -82,20 +105,20 @@ fn parse(out: &str) -> Vec<Item> {
             continue;
         }
         match f.as_slice() {
-            ["appx", full, name, nonremovable] if *nonremovable != "True" && is_junk(name) => v.push(Item::Appx { full: full.to_string(), name: name.to_string() }),
-            ["prov", pkg, name] if is_junk(name) => v.push(Item::Prov { pkg: pkg.to_string(), name: name.to_string() }),
+            ["appx", full, name, nonremovable] if *nonremovable != "True" && is_junk_with_opts(name, keep_xbox) => v.push(Item::Appx { full: full.to_string(), name: name.to_string() }),
+            ["prov", pkg, name] if is_junk_with_opts(name, keep_xbox) => v.push(Item::Prov { pkg: pkg.to_string(), name: name.to_string() }),
             _ => {}
         }
     }
     v
 }
 
-fn found() -> Result<Vec<Item>, String> {
+fn found(keep_xbox: bool) -> Result<Vec<Item>, String> {
     let (ok, out) = ps(r#"Get-AppxPackage -AllUsers | ForEach-Object { "appx|$($_.PackageFullName)|$($_.Name)|$($_.NonRemovable)" }; Get-AppxProvisionedPackage -Online | ForEach-Object { "prov|$($_.PackageName)|$($_.DisplayName)" }"#);
     if !ok && out.trim().is_empty() {
         return Err("cannot list apps (run as administrator)".into());
     }
-    Ok(parse(&out))
+    Ok(parse_with_opts(&out, keep_xbox))
 }
 
 fn task_exists(t: &str) -> bool {
@@ -114,9 +137,9 @@ fn edge_setup() -> Option<PathBuf> {
     vs.pop()
 }
 
-fn plan(od: bool, edge: bool) {
+fn plan(od: bool, edge: bool, keep_xbox: bool) {
     println!("Dry run: nothing is removed. --apply REMOVES it FOR GOOD (no undo).\n");
-    match found() {
+    match found(keep_xbox) {
         Ok(items) => {
             for i in &items {
                 match i {
@@ -139,7 +162,7 @@ fn plan(od: bool, edge: bool) {
     }
 }
 
-fn apply(od: bool, edge: bool) -> Result<(), String> {
+fn apply(od: bool, edge: bool, keep_xbox: bool) -> Result<(), String> {
     let dir = PathBuf::from(env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("winrust-purge");
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e} (run as admin)", dir.display()))?;
     let mut log = fs::OpenOptions::new().create(true).append(true).open(dir.join("removed.txt")).map_err(|e| e.to_string())?;
@@ -152,7 +175,7 @@ fn apply(od: bool, edge: bool) -> Result<(), String> {
             failed += 1;
         }
     };
-    for i in found()? {
+    for i in found(keep_xbox)? {
         match i {
             Item::Appx { full, name } => did(format!("app {name}"), ps(&format!("Remove-AppxPackage -Package '{full}' -AllUsers -ErrorAction Stop")).0),
             Item::Prov { pkg, name } => did(format!("provisioned {name}"), ps(&format!("Remove-AppxProvisionedPackage -Online -PackageName '{pkg}' -ErrorAction Stop")).0),
@@ -185,22 +208,23 @@ fn apply(od: bool, edge: bool) -> Result<(), String> {
 fn main() {
     let a: Vec<String> = env::args().skip(1).collect();
     let has = |f: &str| a.iter().any(|x| x == f);
+    let keep_xbox = has("--keep-xbox");
     let r = if has("--ask") {
-        plan(has("--onedrive"), has("--edge"));
+        plan(has("--onedrive"), has("--edge"), keep_xbox);
         print!("
 This REMOVES the apps above FOR GOOD, there is no undo. Type YES to continue: ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        let r = if line.trim() == "YES" { apply(has("--onedrive"), has("--edge")) } else { println!("Nothing removed."); Ok(()) };
+        let r = if line.trim() == "YES" { apply(has("--onedrive"), has("--edge"), keep_xbox) } else { println!("Nothing removed."); Ok(()) };
         println!("
 Press Enter to close.");
         let _ = std::io::stdin().read_line(&mut line);
         r
     } else if has("--apply") {
-        apply(has("--onedrive"), has("--edge"))
+        apply(has("--onedrive"), has("--edge"), keep_xbox)
     } else {
-        plan(has("--onedrive"), has("--edge"));
+        plan(has("--onedrive"), has("--edge"), keep_xbox);
         Ok(())
     };
     if let Err(e) = r {
@@ -221,6 +245,10 @@ mod tests {
         for n in ["Microsoft.WindowsStore", "windows.immersivecontrolpanel", "Microsoft.Windows.ShellExperienceHost", "Microsoft.Windows.StartMenuExperienceHost", "Microsoft.WindowsCalculator", "Microsoft.XboxIdentityProvider", "MicrosoftWindows.Client.CBS", "Microsoft.VCLibs.140.00", "Microsoft.Windows.Photos"] {
             assert!(!is_junk(n), "{n}");
         }
+        assert!(is_junk_with_opts("Microsoft.GamingApp", false));
+        assert!(!is_junk_with_opts("Microsoft.GamingApp", true));
+        assert!(!is_junk_with_opts("Microsoft.XboxGamingOverlay", true));
+        assert!(is_junk_with_opts("Microsoft.BingNews", true));
     }
 
     #[test]

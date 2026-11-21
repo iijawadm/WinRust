@@ -2,7 +2,7 @@
 //! версия DirectX через D3D12 и физическое расположение через SetupAPI.
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
+use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryW};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -76,17 +76,21 @@ fn directx_level(adapter: *mut c_void) -> String {
         }
         let f = GetProcAddress(lib, c"D3D12CreateDevice".as_ptr());
         if f.is_null() {
+            FreeLibrary(lib);
             return "DirectX 11".into();
         }
         let create: unsafe extern "system" fn(*mut c_void, i32, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(f);
+        let mut out = String::from("DirectX 11");
         for (fl, name) in [(0xC200, "12_2"), (0xC100, "12_1"), (0xC000, "12_0"), (0xB100, "11_1"), (0xB000, "11_0")] {
             // ppDevice = NULL: функция только проверяет, можно ли создать устройство (0 или 1 — можно)
             let hr = create(adapter, fl, &IID_ID3D12DEVICE, null_mut());
             if hr == 0 || hr == 1 {
-                return format!("DirectX {} (FL {name})", if fl >= 0xC000 { "12" } else { "11" });
+                out = format!("DirectX {} (FL {name})", if fl >= 0xC000 { "12" } else { "11" });
+                break;
             }
         }
-        "DirectX 11".into()
+        FreeLibrary(lib);
+        out
     }
 }
 

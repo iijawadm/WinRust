@@ -6,6 +6,7 @@
 //   defender   Defender exclusions for build caches and game libraries (opt-in: those folders are no longer scanned)
 //   ntfs       NTFS stops updating last-access times and creating 8.3 short names (after a reboot)
 //   dns        ad and tracker domains blocked in the hosts file
+//   gaming     low-latency gaming registry tweaks: Windows Game Mode, Game DVR off, HAGS on, MMCSS game GPU/CPU priority & no network throttling
 // debloat --status <group>     prints on/off; exit code 0 = applied (its undo file exists)
 //
 // Only reversible things. Not touched on purpose: Windows Update, Print Spooler, Xbox/Game services, SysMain, installed apps,
@@ -95,6 +96,19 @@ const NTFS_REGS: &[(&str, &str, u32, &str)] = &[
     (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisable8dot3NameCreation", 1, "no 8.3 short name created with every new file"),
 ];
 
+const GAMING_REGS: &[(&str, &str, u32, &str)] = &[
+    (r"HKCU\Software\Microsoft\GameBar", "AutoGameModeEnabled", 1, "Windows Game Mode on"),
+    (r"HKCU\Software\Microsoft\GameBar", "AllowAutoGameMode", 1, "allow Windows Game Mode"),
+    (r"HKCU\System\GameConfigStore", "GameDVR_Enabled", 0, "disable Game DVR background capture"),
+    (r"HKCU\System\GameConfigStore", "GameDVR_FSEBehaviorMode", 2, "clean fullscreen presentation behavior"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR", "AllowGameDVR", 0, "policy: Game Bar background capture off"),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode", 2, "Hardware-Accelerated GPU Scheduling (HAGS) on"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness", 10, "reserve 90% CPU for games and multimedia"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex", 0xFFFF_FFFF, "disable multimedia network packet throttling"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", 8, "high GPU scheduling priority for games"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Priority", 6, "high CPU scheduling priority for games"),
+];
+
 const DEF_PROCS: &[&str] = &["cargo.exe", "rustc.exe"];
 
 const HOSTS_BEGIN: &str = "# >>> WinRust DNS block >>>";
@@ -138,6 +152,7 @@ enum Group {
     Defender,
     Ntfs,
     Dns,
+    Gaming,
 }
 
 impl Group {
@@ -147,6 +162,7 @@ impl Group {
             "defender" => Group::Defender,
             "ntfs" => Group::Ntfs,
             "dns" => Group::Dns,
+            "gaming" => Group::Gaming,
             _ => return None,
         })
     }
@@ -157,6 +173,7 @@ impl Group {
             Group::Defender => "undo-defender.txt",
             Group::Ntfs => "undo-ntfs.txt",
             Group::Dns => "undo-dns.txt",
+            Group::Gaming => "undo-gaming.txt",
         }
     }
 }
@@ -267,11 +284,51 @@ fn defender_paths() -> Vec<String> {
     }
     if let Some(pf) = env::var_os("ProgramFiles").map(PathBuf::from) {
         v.push(pf.join("Epic Games"));
+        v.push(pf.join("EA Games"));
     }
+    if let Some(pf86) = env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
+        v.push(pf86.join("Epic Games"));
+        v.push(pf86.join(r"GOG Galaxy\Games"));
+        v.push(pf86.join(r"Ubisoft\Ubisoft Game Launcher\games"));
+        v.push(pf86.join("Battle.net"));
+    }
+    for drive in ['C', 'D', 'E', 'F'] {
+        v.push(PathBuf::from(format!(r"{drive}:\XboxGames")));
+    }
+    v.push(PathBuf::from(r"C:\GOG Games"));
+    v.push(PathBuf::from(r"C:\Riot Games"));
     v.extend(steam_libraries());
+    v.extend(epic_libraries());
     // SteamPath is stored with forward slashes and in lower case: one spelling per folder
     let mut seen = std::collections::HashSet::new();
     v.into_iter().filter(|p| p.is_dir()).map(|p| p.display().to_string().replace('/', "\\")).filter(|p| seen.insert(p.to_lowercase())).collect()
+}
+
+fn epic_libraries() -> Vec<PathBuf> {
+    let dat = PathBuf::from(env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+        .join(r"Epic\UnrealEngineLauncher\LauncherInstalled.dat");
+    let Ok(text) = fs::read_to_string(dat) else { return vec![] };
+    parse_epic_install_roots(&text).into_iter().map(PathBuf::from).collect()
+}
+
+/// Parent folders of Epic Games installs from LauncherInstalled.dat (`"InstallLocation": "D:\\Games\\Fortnite"` -> `D:\Games`).
+fn parse_epic_install_roots(json: &str) -> Vec<String> {
+    let mut out = vec![];
+    for l in json.lines() {
+        let f: Vec<&str> = l.split('"').collect();
+        if f.len() >= 4 && f[1] == "InstallLocation" {
+            let full = f[3].replace(r"\\", r"\").replace('/', r"\");
+            let trimmed = full.trim_end_matches('\\');
+            if let Some((parent, _)) = trimmed.rsplit_once('\\') {
+                if !parent.is_empty() && !parent.ends_with(':') {
+                    out.push(parent.to_string());
+                } else if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn steam_libraries() -> Vec<PathBuf> {
@@ -330,6 +387,7 @@ fn plan(g: Group) {
         Group::Base => (SERVICES, REGS),
         Group::Updaters => (UPD_SERVICES, &[]),
         Group::Ntfs => (&[], NTFS_REGS),
+        Group::Gaming => (&[], GAMING_REGS),
         _ => (&[], &[]),
     };
     for (svc, why) in svcs {
@@ -507,6 +565,7 @@ fn apply(g: Group) -> Result<(), String> {
         Group::Defender => apply_defender(&mut log)?,
         Group::Ntfs => apply_regs(NTFS_REGS, &mut log)?,
         Group::Dns => apply_dns(&mut log)?,
+        Group::Gaming => apply_regs(GAMING_REGS, &mut log)?,
     };
     drop(log);
     // nothing was changed (all skipped): no undo file, so the group does not show as applied
@@ -561,7 +620,7 @@ fn main() {
         Some(g) => match Group::parse(g) {
             Some(g) => g,
             None => {
-                eprintln!("unknown group '{g}' (updaters, defender, ntfs, dns)");
+                eprintln!("unknown group '{g}' (updaters, defender, ntfs, dns, gaming)");
                 std::process::exit(2);
             }
         },
@@ -644,9 +703,20 @@ mod tests {
 
     #[test]
     fn groups_parse_and_have_own_files() {
-        let gs = ["updaters", "defender", "ntfs", "dns"].map(|g| Group::parse(g).unwrap());
+        let gs = ["updaters", "defender", "ntfs", "dns", "gaming"].map(|g| Group::parse(g).unwrap());
         let files: std::collections::HashSet<_> = gs.iter().map(|g| g.file()).chain([Group::Base.file()]).collect();
-        assert_eq!(files.len(), 5);
+        assert_eq!(files.len(), 6);
         assert_eq!(Group::parse("x"), None);
+    }
+
+    #[test]
+    fn gaming_regs_and_epic_manifest_parse() {
+        let mut seen = std::collections::HashSet::new();
+        for (k, v, _, _) in GAMING_REGS {
+            assert!(k.starts_with("HKLM\\") || k.starts_with("HKCU\\"), "{k}");
+            assert!(seen.insert((k, v)), "duplicate {k} {v}");
+        }
+        let dat = "{\n\t\"InstallationList\": [\n\t\t{\n\t\t\t\"InstallLocation\": \"D:\\\\EpicGames\\\\Fortnite\"\n\t\t},\n\t\t{\n\t\t\t\"InstallLocation\": \"E:/Games/RocketLeague\"\n\t\t}\n\t]\n}";
+        assert_eq!(parse_epic_install_roots(dat), vec![r"D:\EpicGames", r"E:\Games"]);
     }
 }

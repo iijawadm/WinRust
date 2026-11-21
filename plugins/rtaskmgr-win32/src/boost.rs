@@ -16,6 +16,9 @@ use winapi::um::{winnt::{KEY_READ, REG_SZ}, winreg::*};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Id {
     Game,
+    AutoGame,
+    WinLock,
+    Gaming,
     Work,
     MemNow,
     MemAuto,
@@ -26,12 +29,28 @@ pub enum Id {
     Dns,
 }
 
-pub const ALL: [Id; 9] = [Id::Game, Id::Work, Id::MemNow, Id::MemAuto, Id::Shell, Id::Updaters, Id::Defender, Id::Ntfs, Id::Dns];
+pub const ALL: [Id; 12] = [
+    Id::Game,
+    Id::AutoGame,
+    Id::WinLock,
+    Id::Gaming,
+    Id::Work,
+    Id::MemNow,
+    Id::MemAuto,
+    Id::Shell,
+    Id::Updaters,
+    Id::Defender,
+    Id::Ntfs,
+    Id::Dns,
+];
 
 impl Id {
     pub fn key(self) -> &'static str {
         match self {
             Id::Game => "game",
+            Id::AutoGame => "autogame",
+            Id::WinLock => "winlock",
+            Id::Gaming => "gaming",
             Id::Work => "work",
             Id::MemNow => "memnow",
             Id::MemAuto => "memauto",
@@ -48,6 +67,9 @@ impl Id {
     pub fn title(self) -> &'static str {
         match self {
             Id::Game => t!("Профиль «Игра»", "'Game' profile"),
+            Id::AutoGame => t!("Авторежим «Игра» (topbar)", "Auto Game Mode (topbar)"),
+            Id::WinLock => t!("Блокировать Win в играх", "Lock Win key in fullscreen games"),
+            Id::Gaming => t!("Игровые настройки Windows (HAGS, MMCSS, DVR)", "Windows gaming tweaks (HAGS, MMCSS, DVR)"),
             Id::Work => t!("Профиль «Работа»", "'Work' profile"),
             Id::MemNow => t!("Очистить кэш памяти сейчас", "Clear memory cache now"),
             Id::MemAuto => t!("Очищать кэш памяти при нехватке", "Clear memory cache when it runs short"),
@@ -60,19 +82,22 @@ impl Id {
     }
     pub fn desc(self) -> &'static str {
         match self {
-            Id::Game => t!("Останавливает Windows Update, BITS, оптимизацию доставки, печать, телеметрию; закрывает OneDrive, Teams, Dropbox, Google Drive, Phone Link, виджеты. «Выключить» всё запускает обратно.", "Stops Windows Update, BITS, Delivery Optimization, printing, telemetry; closes OneDrive, Teams, Dropbox, Google Drive, Phone Link, widgets. 'Disable' starts everything again."),
+            Id::Game => t!("Останавливает Windows Update, BITS, SysMain, оптимизацию доставки, печать, телеметрию; закрывает OneDrive, Teams, Dropbox, Google Drive, Phone Link, виджеты; включает максимальную производительность, очищает кэш памяти и блокирует Win в играх. «Выключить» всё возвращает.", "Stops Windows Update, BITS, SysMain, Delivery Optimization, printing, telemetry; closes OneDrive, Teams, Dropbox, Google Drive, Phone Link, widgets; switches to High/Ultimate Performance power plan, purges standby RAM and locks Win in games. 'Disable' restores everything."),
+            Id::AutoGame => t!("Когда запущена полноэкранная игра (браузеры и плееры не трогаются): topbar поднимает приоритет игры, включает таймер 0,5 мс, режим максимальной производительности от сети и блокирует клавишу Win. При выходе из игры всё возвращается.", "When a fullscreen game runs (browsers and media players are excluded): topbar boosts the game's priority, engages 0.5 ms timer resolution, switches to Best Performance on AC and locks the Win key. Restores everything on exit."),
+            Id::WinLock => t!("Игнорирует случайные нажатия Win и Win+D/E/I/1-3 в полноэкранных играх (Alt+Tab и Ctrl+Shift+Esc работают). Также переключается сочетанием Win+Shift+G.", "Suppresses accidental Win and Win+D/E/I/1-3 presses inside fullscreen games (Alt+Tab and Ctrl+Shift+Esc keep working). Also toggles with Win+Shift+G."),
+            Id::Gaming => t!("Включает Игровой режим Windows и HAGS (аппаратное планирование GPU), отключает фоновую запись Game DVR, задаёт играм высокий приоритет GPU/ЦП в MMCSS и убирает ограничение сетевых пакетов. Полностью обратимо (часть изменений после перезагрузки).", "Enables Windows Game Mode and HAGS (Hardware-Accelerated GPU Scheduling), disables Game DVR background recording, sets high MMCSS GPU/CPU priority for games and disables network throttling. Fully reversible (some changes need a reboot)."),
             Id::Work => t!("Закрывает Steam, Epic, Battle.net, EA, Ubisoft, GOG, Overwolf, Xbox и Game Bar, останавливает их службы. «Выключить» запускает лаунчеры обратно.", "Closes Steam, Epic, Battle.net, EA, Ubisoft, GOG, Overwolf, Xbox and Game Bar, stops their services. 'Disable' starts the launchers again."),
             Id::MemNow => t!("Сбрасывает список standby (кэш файлов, который никто не держит), как ISLC. Помогает от рывков в играх, когда свободной памяти нет.", "Drops the standby list (cached file data nobody holds), like ISLC. Helps against stutter in games when no memory is free."),
             Id::MemAuto => t!("Панель topbar каждые 10 с проверяет память и сбрасывает кэш, если свободно меньше 5% (не меньше 512 МБ), а кэш больше 1 ГБ; не чаще раза в минуту.", "The topbar checks memory every 10 s and drops the cache when less than 5% (at least 512 MB) is free and the cache holds over 1 GB; at most once a minute."),
             Id::Shell => t!("Меню «Пуск» Windows, виджеты и Связь с телефоном не запускаются (их заменяет topbar). Уведомления и ввод текста не трогаются.", "The Windows Start menu, widgets and Phone Link do not start (topbar replaces them). Notifications and text input are not touched."),
             Id::Updaters => t!("Отключает службы и задачи обновления Adobe, Mozilla, Dropbox, CCleaner, Opera, Apple, Zoom, OneDrive; раз в неделю winget обновляет все программы. Браузеры обновляются сами, как раньше.", "Disables updater services and tasks of Adobe, Mozilla, Dropbox, CCleaner, Opera, Apple, Zoom, OneDrive; winget updates every app once a week. Browsers keep updating themselves."),
-            Id::Defender => t!("Defender перестаёт проверять кэши cargo, rustup, npm, pip, NuGet, Gradle и библиотеки Steam/Epic, а также cargo.exe и rustc.exe. Сборка и загрузка игр быстрее, но эти папки не сканируются.", "Defender stops scanning the caches of cargo, rustup, npm, pip, NuGet, Gradle and the Steam/Epic libraries, and cargo.exe and rustc.exe. Builds and game loading get faster, but those folders are not scanned."),
+            Id::Defender => t!("Defender перестаёт проверять кэши cargo, rustup, npm, pip, NuGet, Gradle и библиотеки Steam, Epic, Xbox, GOG, EA, Ubisoft, Riot, Battle.net, а также cargo.exe и rustc.exe. Сборка и загрузка игр быстрее, но эти папки не сканируются.", "Defender stops scanning the caches of cargo, rustup, npm, pip, NuGet, Gradle and Steam/Epic/Xbox/GOG/EA/Ubisoft/Riot/Battle.net game libraries, plus cargo.exe and rustc.exe. Builds and game loading get faster, but those folders are not scanned."),
             Id::Ntfs => t!("NTFS не пишет время последнего доступа при каждом чтении и не создаёт короткие имена 8.3. Действует после перезагрузки.", "NTFS stops writing the last-access time on every read and creating 8.3 short names. Takes effect after a reboot."),
             Id::Dns => t!("Около 170 рекламных и следящих доменов ведут в никуда через файл hosts (домены Microsoft не трогаются).", "About 170 ad and tracker domains lead nowhere through the hosts file (Microsoft domains are left alone)."),
         }
     }
     fn debloat_group(self) -> Option<&'static str> {
-        matches!(self, Id::Updaters | Id::Defender | Id::Ntfs | Id::Dns).then(|| self.key())
+        matches!(self, Id::Gaming | Id::Updaters | Id::Defender | Id::Ntfs | Id::Dns).then(|| self.key())
     }
 }
 
@@ -87,6 +112,10 @@ pub enum State {
 
 static BUSY: Mutex<Vec<Id>> = Mutex::new(vec![]);
 static DONE: Mutex<Vec<String>> = Mutex::new(vec![]);
+
+pub fn is_busy() -> bool {
+    !BUSY.lock().unwrap().is_empty()
+}
 
 pub fn take_done() -> Vec<String> {
     std::mem::take(&mut *DONE.lock().unwrap())
@@ -124,6 +153,9 @@ pub fn state(id: Id, is_admin: bool) -> State {
     let on = |b: bool| if b { State::On } else { State::Off };
     match id {
         Id::Game | Id::Work => on(active_profile() == Some(id)),
+        Id::AutoGame if !topbar_installed() => State::Unavailable(t!("нужна панель topbar", "needs the topbar").into()),
+        Id::AutoGame => on(winrust_common::gaming::auto_game()),
+        Id::WinLock => on(winrust_common::gaming::win_lock()),
         Id::MemNow => match winrust_common::mem::lists() {
             Some(l) => State::Info(tf!("свободно {}, кэш {}", "free {}, cache {}", crate::ui::fmt_mem(l.free), crate::ui::fmt_mem(l.standby))),
             None => State::Unavailable(t!("нет права SeProfileSingleProcess", "no SeProfileSingleProcess right").into()),
@@ -166,6 +198,14 @@ fn run(id: Id, on: bool, donors: &[u32]) -> Result<String, String> {
     match id {
         Id::Game | Id::Work if on => profile_on(id, donors),
         Id::Game | Id::Work => profile_off(donors),
+        Id::AutoGame => {
+            winrust_common::gaming::set_auto_game(on);
+            Ok(if on { t!("включено (работает, пока запущена панель)", "on (works while the bar runs)") } else { t!("выключено", "off") }.into())
+        }
+        Id::WinLock => {
+            winrust_common::gaming::set_win_lock(on);
+            Ok(if on { t!("включено (Win+Shift+G для быстрого переключения)", "on (press Win+Shift+G anytime to toggle)") } else { t!("выключено", "off") }.into())
+        }
         Id::MemNow => {
             let before = winrust_common::mem::lists();
             winrust_common::mem::purge_standby().map_err(|st| tf!("NTSTATUS 0x{:08X}", "NTSTATUS 0x{:08X}", st as u32))?;
@@ -206,6 +246,8 @@ pub fn undo_all() -> Vec<String> {
     for id in ALL {
         let applied = match id {
             Id::Game => active_profile().is_some(),
+            Id::AutoGame => winrust_common::gaming::auto_game(),
+            Id::WinLock => winrust_common::gaming::win_lock(),
             Id::Work | Id::MemNow => false, // один файл профиля на оба; очистка — разовое действие
             Id::MemAuto => winrust_common::mem::auto_on(),
             Id::Shell => SHELL_EXES.iter().any(|e| debugger(e).is_some_and(|d| ours(&d))),
@@ -223,7 +265,7 @@ pub fn undo_all() -> Vec<String> {
 /// (имя процесса, аргументы для запуска обратно; None — не запускать: помощник или пакетное приложение, оно встанет само)
 type ProcSpec = (&'static str, Option<&'static str>);
 
-const GAME_SVCS: &[&str] = &["wuauserv", "BITS", "DoSvc", "UsoSvc", "Spooler", "WSearch", "DiagTrack", "MapsBroker", "WerSvc"];
+const GAME_SVCS: &[&str] = &["wuauserv", "BITS", "DoSvc", "UsoSvc", "Spooler", "WSearch", "DiagTrack", "MapsBroker", "WerSvc", "SysMain", "TabletInputService", "RemoteRegistry"];
 const GAME_PROCS: &[ProcSpec] = &[
     ("onedrive.exe", Some("/background")),
     ("teams.exe", None),
@@ -234,6 +276,10 @@ const GAME_PROCS: &[ProcSpec] = &[
     ("widgets.exe", None),
     ("adobecollabsync.exe", None),
     ("creative cloud.exe", None),
+    ("adobeipcbroker.exe", None),
+    ("ccxprocess.exe", None),
+    ("m365copilot.exe", None),
+    ("icloudservices.exe", None),
 ];
 const WORK_SVCS: &[&str] = &["Steam Client Service", "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "EABackgroundService", "EpicOnlineServices"];
 const WORK_PROCS: &[ProcSpec] = &[
@@ -272,6 +318,46 @@ pub fn parse_profile(text: &str) -> Option<(Id, Vec<String>, Vec<String>)> {
         }
     }
     Some((id, svcs, runs))
+}
+
+/// Извлекает сохранённый GUID схемы питания (`pwr|<guid>`) из файла профиля.
+pub fn parse_profile_power(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.strip_prefix("pwr|").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+}
+
+/// Извлекает первый GUID вида `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` из вывода `powercfg /getactivescheme`.
+pub fn parse_power_guid(out: &str) -> Option<String> {
+    out.split_whitespace().find_map(|tok| {
+        let s = tok.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != '-');
+        let parts: Vec<&str> = s.split('-').collect();
+        (parts.len() == 5
+            && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(&n, p)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit())))
+        .then(|| s.to_ascii_lowercase())
+    })
+}
+
+fn active_power_guid() -> Option<String> {
+    let o = Command::new("powercfg.exe").args(["/getactivescheme"]).creation_flags(0x0800_0000).output().ok()?;
+    o.status.success().then(|| parse_power_guid(&String::from_utf8_lossy(&o.stdout))).flatten()
+}
+
+fn set_power_guid(guid: &str) -> bool {
+    Command::new("powercfg.exe").args(["/setactive", guid]).creation_flags(0x0800_0000).status().is_ok_and(|s| s.success())
+}
+
+/// Переключает на Ultimate Performance или High Performance (если одна из схем есть в системе). Возвращает прежний GUID.
+fn boost_power_plan() -> Option<String> {
+    const ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+    const HIGH: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+    let old = active_power_guid()?;
+    if old == ULTIMATE || old == HIGH {
+        return None;
+    }
+    if set_power_guid(ULTIMATE) || set_power_guid(HIGH) {
+        Some(old)
+    } else {
+        None
+    }
 }
 
 fn active_profile() -> Option<Id> {
@@ -318,6 +404,12 @@ fn profile_on(id: Id, donors: &[u32]) -> Result<String, String> {
     for r in &runs {
         text += &format!("run|{r}\n");
     }
+    if id == Id::Game {
+        if let Some(old_pwr) = boost_power_plan() {
+            text += &format!("pwr|{old_pwr}\n");
+        }
+        let _ = winrust_common::mem::purge_standby();
+    }
     let f = profile_file();
     fs::create_dir_all(f.parent().unwrap()).and_then(|_| fs::write(&f, text)).map_err(|e| e.to_string())?;
     Ok(tf!("остановлено служб: {stopped}, закрыто процессов: {closed}", "{stopped} services stopped, {closed} processes closed"))
@@ -325,9 +417,13 @@ fn profile_on(id: Id, donors: &[u32]) -> Result<String, String> {
 
 fn profile_off(donors: &[u32]) -> Result<String, String> {
     let f = profile_file();
-    let Some((_, svcs, runs)) = fs::read_to_string(&f).ok().and_then(|t| parse_profile(&t)) else {
+    let raw = fs::read_to_string(&f).ok();
+    let Some((_, svcs, runs)) = raw.as_deref().and_then(parse_profile) else {
         return Ok(t!("профиль не был включён", "no profile was on").into());
     };
+    if let Some(old_pwr) = raw.as_deref().and_then(parse_profile_power) {
+        let _ = set_power_guid(&old_pwr);
+    }
     let started = svcs.iter().filter(|s| sys::service_ctl(s, true).is_ok()).count();
     let mut launched = 0;
     for r in &runs {
@@ -433,5 +529,15 @@ mod tests {
     #[test]
     fn needs_admin_without_it() {
         assert!(matches!(state(Id::Game, false), State::Unavailable(_)));
+    }
+
+    #[test]
+    fn parses_power_guid_and_profile_power_line() {
+        let out = "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)\r\n";
+        assert_eq!(parse_power_guid(out).as_deref(), Some("381b4222-f694-41f0-9685-ff5bb260df2e"));
+        assert_eq!(parse_power_guid("no guid here"), None);
+        let t = "game\nsvc|wuauserv\npwr|381b4222-f694-41f0-9685-ff5bb260df2e\n";
+        assert_eq!(parse_profile_power(t).as_deref(), Some("381b4222-f694-41f0-9685-ff5bb260df2e"));
+        assert_eq!(parse_profile_power("work\n"), None);
     }
 }

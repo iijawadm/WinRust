@@ -127,16 +127,41 @@ pub fn priority_name(pid: u32) -> String {
     PRIORITIES.iter().find(|p| p.1 == c).map_or("—".into(), |p| p.0.into())
 }
 
-/// `half = true` — только первая половина логических ядер, иначе все.
-pub fn set_affinity(pid: u32, half: bool) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AffinityMode {
+    All,
+    FirstHalf, // CCD0 on dual-CCD Ryzen X3D / P-cores on hybrid Intel
+    NoCore0,   // exclude Core 0 (Windows interrupts/DPCs) to reduce game microstutter
+    EvenCores, // physical cores only (no SMT/HT)
+}
+
+/// Вычисляет маску ядер для заданного режима, гарантируя ненулевой результат при ненулевой системной маске.
+pub fn affinity_mask(sm: usize, mode: AffinityMode) -> usize {
+    match mode {
+        AffinityMode::All => sm,
+        AffinityMode::FirstHalf => {
+            let cores = sm.count_ones();
+            if cores > 1 { first_n_bits(sm, cores / 2) } else { sm }
+        }
+        AffinityMode::NoCore0 => {
+            let m = sm & !1usize;
+            if m != 0 { m } else { sm }
+        }
+        AffinityMode::EvenCores => {
+            let even = usize::MAX / 3; // 0x5555... на 32 и 64 битах
+            let m = sm & even;
+            if m != 0 { m } else { sm }
+        }
+    }
+}
+
+pub fn set_affinity(pid: u32, mode: AffinityMode) -> bool {
     with_proc(pid, PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, |h| unsafe {
         let (mut pm, mut sm) = (0usize, 0usize);
         if GetProcessAffinityMask(h, &mut pm, &mut sm) == 0 {
             return false;
         }
-        let cores = sm.count_ones();
-        let mask = if half && cores > 1 { first_n_bits(sm, cores / 2) } else { sm };
-        SetProcessAffinityMask64(h, mask) != 0
+        SetProcessAffinityMask64(h, affinity_mask(sm, mode)) != 0
     })
     .unwrap_or(false)
 }
@@ -361,6 +386,10 @@ mod tests {
         assert_eq!(first_n_bits(0b1111_0000, 2), 0b0011_0000);
         assert_eq!(first_n_bits(0b1111, 4), 0b1111);
         assert_eq!(first_n_bits(usize::MAX, 40), (1usize << 40) - 1); // ядра за пределами 32-го бита
+        assert_eq!(affinity_mask(0b1111, AffinityMode::NoCore0), 0b1110);
+        assert_eq!(affinity_mask(0b0001, AffinityMode::NoCore0), 0b0001);
+        assert_eq!(affinity_mask(0b1111_1111, AffinityMode::EvenCores), 0b0101_0101);
+        assert_eq!(affinity_mask(0b1111, AffinityMode::FirstHalf), 0b0011);
     }
 }
 

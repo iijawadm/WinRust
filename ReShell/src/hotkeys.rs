@@ -78,26 +78,39 @@ fn go(target: usize) {
 unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 {
         let k = unsafe { &*(l as *const KBDLLHOOKSTRUCT) };
-        let win = unsafe { (GetAsyncKeyState(VK_LWIN as i32) | GetAsyncKeyState(VK_RWIN as i32)) as u16 & 0x8000 != 0 };
         if (w == WM_KEYUP as usize || w == WM_SYSKEYUP as usize) && HELD.load(Relaxed) == k.vkCode {
             HELD.store(0, Relaxed); // also when Win was let go first
         }
-        if let (Some(act), true) = (win_action(k.vkCode), win && k.flags & LLKHF_INJECTED == 0) {
-            // swallow it so Explorer's own handler (if it still answers) does not act as well
-            if w == WM_KEYDOWN as usize && HELD.swap(k.vkCode, Relaxed) != k.vkCode {
-                send(&[tap(0xE8, false), tap(0xE8, true)]); // Win release must not open Start
-                std::thread::spawn(act);
-            }
-            return 1;
-        }
+        let act = win_action(k.vkCode);
         let id = match k.vkCode { 0x31..=0x33 => Some(k.vkCode as usize - 0x31), 0xC0 => Some(usize::MAX), _ => None };
-        if let (Some(id), true, false) = (id, win, k.flags & LLKHF_INJECTED != 0) {
-            if w == WM_KEYDOWN as usize {
-                // unassigned key tap stops Win release from opening Start; switching runs off the hook thread
-                send(&[tap(0xE8, false), tap(0xE8, true)]);
-                std::thread::spawn(move || go(if id == usize::MAX { PREV.load(Relaxed) } else { id }));
+        // Check the key code BEFORE GetAsyncKeyState: avoids 2 syscalls on every normal/game keystroke (WASD, etc.).
+        if (act.is_some() || id.is_some()) && k.flags & LLKHF_INJECTED == 0 {
+            let win = unsafe { (GetAsyncKeyState(VK_LWIN as i32) | GetAsyncKeyState(VK_RWIN as i32)) as u16 & 0x8000 != 0 };
+            if win {
+                // During a fullscreen game with Win-key lock active, swallow Win+D/E/I/1-3/` without leaving the game.
+                if winrust_common::gaming::should_lock_win_key() && winrust_common::gaming::is_foreground_fullscreen() {
+                    if w == WM_KEYDOWN as usize {
+                        send(&[tap(0xE8, false), tap(0xE8, true)]);
+                    }
+                    return 1;
+                }
+                if let Some(act) = act {
+                    // swallow it so Explorer's own handler (if it still answers) does not act as well
+                    if w == WM_KEYDOWN as usize && HELD.swap(k.vkCode, Relaxed) != k.vkCode {
+                        send(&[tap(0xE8, false), tap(0xE8, true)]); // Win release must not open Start
+                        std::thread::spawn(act);
+                    }
+                    return 1;
+                }
+                if let Some(id) = id {
+                    if w == WM_KEYDOWN as usize && HELD.swap(k.vkCode, Relaxed) != k.vkCode {
+                        // unassigned key tap stops Win release from opening Start; switching runs off the hook thread
+                        send(&[tap(0xE8, false), tap(0xE8, true)]);
+                        std::thread::spawn(move || go(if id == usize::MAX { PREV.load(Relaxed) } else { id }));
+                    }
+                    return 1;
+                }
             }
-            return 1;
         }
     }
     unsafe { CallNextHookEx(HOOK.load(Relaxed) as _, n, w, l) }

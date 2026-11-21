@@ -134,6 +134,7 @@ static DESK_HIDE: AtomicBool = AtomicBool::new(false); // the desktop in front a
 static WIN_ALONE: AtomicBool = AtomicBool::new(false);
 static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook thread
 const VOLKEY: u32 = WM_APP + 14; // posted by the keyboard hook: a volume key (wp 0 up, 1 down, 2 mute)
+const GAME_LOCK: u32 = WM_APP + 15; // posted by the keyboard hook: Win+Shift+G toggles Win-key lock in games
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
@@ -1471,9 +1472,13 @@ unsafe fn bar_anim(hwnd: HWND) {
     SetTimer(hwnd, 5, 15, None);
 }
 
+thread_local! {
+    static GAME_BOOST: Cell<Option<(u32, u32)>> = const { Cell::new(None) }; // (pid, old priority class) boosted by Auto Game Mode
+}
+
 unsafe fn bar_step(hwnd: HWND) {
-    // hides for a fullscreen game or video, and with "auto-hide" on while the pointer is away (never otherwise: not over the desktop, not in any style)
-    let target = if FULLSCREEN.load(Relaxed) || (i18n::style::autohide() && DESK_HIDE.load(Relaxed)) { 0.0 } else { 1.0 };
+    // hides for a fullscreen game or video, with "auto-hide" on, or when the floating dock is covered by a window
+    let target = if FULLSCREEN.load(Relaxed) || DESK_HIDE.load(Relaxed) { 0.0 } else { 1.0 };
     let now = now_ms();
     let dt = now.saturating_sub(BAR_T.replace(now)).min(50) as f32;
     let p = BAR_P.get();
@@ -1492,8 +1497,8 @@ unsafe fn bar_step(hwnd: HWND) {
     }
 }
 
-/// True when the foreground window covers the whole primary monitor (game, F11 video, presentation).
-/// A maximized window does not: the bar's reserved strip keeps it below the bar.
+/// True when the foreground window is a true or borderless fullscreen app (game, F11 video, presentation).
+/// Normal maximized windows (which fill the monitor when Floating Dock or auto-hide reserves 0 px) are NOT fullscreen.
 unsafe fn fullscreen_now(bar: HWND) -> bool {
     let fg = GetForegroundWindow();
     if fg.is_null() || fg == bar || IsWindowVisible(fg) == 0 || IsIconic(fg) != 0 {
@@ -1504,37 +1509,75 @@ unsafe fn fullscreen_now(bar: HWND) -> bool {
     if matches!(String::from_utf16_lossy(&cls[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "RustExplorer") {
         return false; // the desktop itself is full size (rs-shell's desktop is a rust-explorer window; a file manager is never "fullscreen")
     }
+    let mut quns: QUERY_USER_NOTIFICATION_STATE = 0;
+    if SHQueryUserNotificationState(&mut quns) == 0 && (quns == QUNS_RUNNING_D3D_FULL_SCREEN || quns == QUNS_PRESENTATION_MODE) {
+        return true;
+    }
     let mut r: RECT = zeroed();
     GetWindowRect(fg, &mut r);
     let mut mi: MONITORINFO = zeroed();
     mi.cbSize = size_of::<MONITORINFO>() as u32;
     GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi);
     let m = mi.rcMonitor;
-    (m.left, m.top) == (0, 0) && r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    let covers = (m.left, m.top) == (0, 0) && r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
+    let style = GetWindowLongW(fg, GWL_STYLE) as u32;
+    i18n::gaming::is_fullscreen_window(style, IsZoomed(fg) != 0, covers)
 }
 
-/// True when no app window is on screen (none open, or all minimized: Win+D): the user is looking at the desktop.
-unsafe fn desktop_now() -> bool {
-    BTNS.with_borrow(|b| b.iter().flat_map(|b| &b.wins).all(|&w| IsIconic(w) != 0))
+/// Applies or releases automatic gaming optimizations (0.5 ms timer resolution, Best Performance power overlay on AC,
+/// and Above Normal priority + EcoQoS off for the active fullscreen game process). Excludes browsers & media players.
+unsafe fn update_game_mode(fs: bool) {
+    if !fs {
+        i18n::gaming::set_timer_res(false);
+        quick::set_game_power(false);
+        if let Some((pid, old)) = GAME_BOOST.take() {
+            i18n::gaming::restore_process(pid, old);
+        }
+        return;
+    }
+    let fg = GetForegroundWindow();
+    let exe = if fg.is_null() { String::new() } else { exe_of(fg) };
+    let is_game = !i18n::gaming::is_non_game_fullscreen_exe(&exe);
+    let want_timer = is_game && (i18n::gaming::timer_boost() || i18n::gaming::auto_game() || i18n::gaming::game_profile_active());
+    i18n::gaming::set_timer_res(want_timer);
+    if is_game && i18n::gaming::auto_game() {
+        quick::set_game_power(true);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, &mut pid);
+        if pid != 0 && GAME_BOOST.get().map(|(p, _)| p) != Some(pid) {
+            if let Some((old_pid, old_cls)) = GAME_BOOST.take() {
+                i18n::gaming::restore_process(old_pid, old_cls);
+            }
+            if let Some(old_cls) = i18n::gaming::boost_process(pid) {
+                GAME_BOOST.set(Some((pid, old_cls)));
+            }
+        }
+    } else {
+        quick::set_game_power(false);
+        if let Some((pid, old)) = GAME_BOOST.take() {
+            i18n::gaming::restore_process(pid, old);
+        }
+    }
 }
 
 unsafe fn fs_update(hwnd: HWND) {
     let fs = fullscreen_now(hwnd);
+    update_game_mode(fs);
     // a fullscreen game keeps the screen: the pointer at the bottom edge does not bring the bar (games park it at the
-    // edges all the time); Win opens Start, which brings the bar with it
+    // edges all the time); Win opens Start (unless Win-key lock is active), which brings the bar with it
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
-    // desktop in front: the bar leaves 2 s after the pointer does and comes back at the bottom edge (an open flyout keeps it)
     let now = now_ms();
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let over = if vert() {
         if i18n::style::side() == i18n::style::Side::Left { pt.x <= 0 || (pt.x < bar_h() && BAR_P.get() > 0.0) } else { pt.x >= sw - 1 || (pt.x >= sw - bar_h() && BAR_P.get() > 0.0) }
     } else if at_top() { pt.y <= 0 || (pt.y < bar_h() && BAR_P.get() > 0.0) } else { pt.y >= sh - 1 || (pt.y >= sh - bar_h() - dock_gap() && BAR_P.get() > 0.0) };
-    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || fly::any_open() || over {
+    let want_hide = i18n::style::autohide() || dock_covered();
+    if fs || !want_hide || fly::any_open() || over {
         DESK_T.set(now);
     }
-    let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
+    let desk = !fs && want_hide && now.saturating_sub(DESK_T.get()) >= 2000;
     if DESK_HIDE.swap(desk, Relaxed) != desk {
         bar_anim(hwnd);
     }
@@ -1542,6 +1585,9 @@ unsafe fn fs_update(hwnd: HWND) {
         if fs {
             fly::close_now();
             hide_tip(hwnd);
+        } else {
+            refresh();
+            InvalidateRect(hwnd, null(), 0);
         }
         bar_anim(hwnd);
     }
@@ -1623,6 +1669,14 @@ unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 }
                 return 1;
             }
+            let win_shift_g = k.vkCode == b'G' as u32 && down0 && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT);
+            if win_shift_g {
+                WIN_ALONE.store(false, Relaxed);
+                keybd_event(0xE8, 0, 0, 0);
+                keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+                PostMessageW(BAR.load(Relaxed) as HWND, GAME_LOCK, 0, 0);
+                return 1;
+            }
             let down = w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize;
             let bar = BAR.load(Relaxed) as HWND;
             // Alt+Tab: our own switcher. Without explorer Windows only flips to the next window blindly, and a fullscreen
@@ -1651,7 +1705,10 @@ unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     WIN_ALONE.store(true, Relaxed);
                 } else if WIN_ALONE.swap(false, Relaxed) {
                     keys(&[0xE8]); // an unassigned key between press and release: Windows no longer opens its own Start
-                    PostMessageW(BAR.load(Relaxed) as HWND, WIN_START, 0, 0);
+                    // While a fullscreen game is active and Win-key lock is enabled, swallow accidental Win presses.
+                    if !(FULLSCREEN.load(Relaxed) && i18n::gaming::should_lock_win_key()) {
+                        PostMessageW(BAR.load(Relaxed) as HWND, WIN_START, 0, 0);
+                    }
                 }
             } else if down {
                 WIN_ALONE.store(false, Relaxed); // Win+something else: a shortcut, not a Start press
@@ -2370,27 +2427,51 @@ unsafe fn unpin(i: usize) {
     DestroyIcon(p.icon);
 }
 
-/// Pins a running app: a shortcut to its exe in the folder where Windows keeps taskbar pins.
-/// A dropped .lnk pins its target. Already pinned (same target) = nothing.
+/// Pins a running app or dropped shortcut into Windows' taskbar pins folder.
+/// Dropping a .lnk copies the shortcut as-is so launch arguments, working directory, custom icons and AUMIDs
+/// (Discord, games with flags, Chrome profiles, Store apps) are preserved.
 unsafe fn pin_exe(path: &str) {
+    let is_lnk = path.to_lowercase().ends_with(".lnk");
     // targets are compared with exe_of(), which is lower-case
-    let exe = if path.to_lowercase().ends_with(".lnk") { lnk_target(&wide(path)) } else { path.to_lowercase() };
-    let exe = exe.as_str();
-    if exe.is_empty() || PINS.with_borrow(|p| p.iter().any(|p| p.target == exe)) {
+    let exe = if is_lnk { lnk_target(&wide(path)) } else { path.to_lowercase() };
+    let target = exe.as_str();
+    if !is_lnk && target.is_empty() {
         return;
     }
-    let stem = std::path::Path::new(exe).file_stem().unwrap_or_default().to_string_lossy().to_string();
-    let name: String = stem.chars().enumerate().map(|(i, c)| if i == 0 { c.to_ascii_uppercase() } else { c }).collect();
+    if !target.is_empty() && PINS.with_borrow(|p| p.iter().any(|p| p.target == target)) {
+        return;
+    }
     let _ = std::fs::create_dir_all(pin_dir());
+    if is_lnk && std::path::Path::new(path).is_file() {
+        let fname = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_string();
+        if fname.is_empty() {
+            return;
+        }
+        let dst = pin_dir().join(&fname);
+        let dst_w = wide(&dst.to_string_lossy());
+        if PINS.with_borrow(|p| p.iter().any(|x| x.lnk == dst_w)) {
+            return;
+        }
+        if std::fs::copy(path, &dst).is_ok() {
+            let icon = lnk_icon(&dst_w, target);
+            PINS.with_borrow_mut(|p| p.push(Pin { lnk: dst_w, target: target.to_string(), icon }));
+            return;
+        }
+    }
+    if target.is_empty() {
+        return;
+    }
+    let stem = std::path::Path::new(target).file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let name: String = stem.chars().enumerate().map(|(i, c)| if i == 0 { c.to_ascii_uppercase() } else { c }).collect();
     let lnk = wide(&pin_dir().join(format!("{name}.lnk")).to_string_lossy());
     let ok = (|| -> Option<()> {
         let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        sl.SetPath(PCWSTR(wide(exe).as_ptr())).ok()?;
+        sl.SetPath(PCWSTR(wide(target).as_ptr())).ok()?;
         sl.cast::<IPersistFile>().ok()?.Save(PCWSTR(lnk.as_ptr()), true).ok()
     })();
     if ok.is_some() {
-        let icon = lnk_icon(&lnk, exe);
-        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), icon }));
+        let icon = lnk_icon(&lnk, target);
+        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: target.to_string(), icon }));
     }
 }
 
@@ -2484,24 +2565,35 @@ unsafe fn style_menu() {
         if k == 0 { it = it.sep(); }
         items.push(it);
     }
+    items.push(fly::MItem::new(t!("Авторежим «Игра»", "Auto Game Mode")).on(i18n::gaming::auto_game()).sep());
+    items.push(fly::MItem::new(t!("Блокировать Win в играх", "Lock Win key in games")).hint("Win+Shift+G").on(i18n::gaming::win_lock()));
     let head = (null_mut(), "\u{E713}", t!("Стиль", "Style").to_string(), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs").to_string());
     let tile = i18n::style::ALL.len();
+    let game_idx = tile + 5; // after tile (0), autohide (1), and 3 sides (2,3,4)
     fly::menu(tip_cx(&bar_layout(bar), GEAR), Some(head), items, move |i| match i18n::style::ALL.get(i) {
         Some(&s) => {
             i18n::style::set_style(s);
             place(bar);
         }
         None if i == tile => tile_windows(),
-        None if i > tile + 1 => {
-            i18n::style::set_side([i18n::style::Side::Bottom, i18n::style::Side::Left, i18n::style::Side::Right][i - tile - 2]);
-            place(bar);
-            bar_anim(bar);
-        }
-        None => {
+        None if i == tile + 1 => {
             i18n::style::set_autohide(!i18n::style::autohide());
             place(bar); // the reserved strip comes or goes with it
             bar_anim(bar);
         }
+        None if i == game_idx => {
+            i18n::gaming::set_auto_game(!i18n::gaming::auto_game());
+            update_game_mode(FULLSCREEN.load(Relaxed));
+        }
+        None if i == game_idx + 1 => {
+            i18n::gaming::set_win_lock(!i18n::gaming::win_lock());
+        }
+        None if i > tile + 1 && i < game_idx => {
+            i18n::style::set_side([i18n::style::Side::Bottom, i18n::style::Side::Left, i18n::style::Side::Right][i - tile - 2]);
+            place(bar);
+            bar_anim(bar);
+        }
+        None => {}
     });
 }
 
@@ -2747,8 +2839,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetTimer(hwnd, 6, 1200, None);
             InvalidateRect(hwnd, null(), 0);
         }
+        GAME_LOCK => {
+            let on = !i18n::gaming::win_lock();
+            i18n::gaming::set_win_lock(on);
+            if !FULLSCREEN.load(Relaxed) {
+                KillTimer(hwnd, 2);
+                let msg = if on {
+                    t!("Блокировка Win в играх: ВКЛ", "Game Win-key lock: ON")
+                } else {
+                    t!("Блокировка Win в играх: ВЫКЛ", "Game Win-key lock: OFF")
+                };
+                show_tip(msg.to_string(), GetSystemMetrics(SM_CXSCREEN) / 2);
+                SetTimer(hwnd, 6, 1800, None);
+            }
+        }
         WM_DROPFILES => on_drop(hwnd, wp as HDROP),
         WM_TIMER => {
+            // While hidden behind a fullscreen game with no flyout open, skip window/Wi-Fi/audio polling and GDI+ repaints
+            // so the bar adds zero background CPU or frame-time jitter during gameplay.
+            if FULLSCREEN.load(Relaxed) && BAR_P.get() == 0.0 && !fly::any_open() {
+                return 0;
+            }
             hide_taskbar_if_shown();
             refresh();
             // repaint (GDI+, the costly part) only when something shown changed; every 10th tick anyway as a safety net
@@ -2814,6 +2925,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE => place(hwnd),
         WM_DESTROY => {
+            update_game_mode(false);
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
             ab.hWnd = hwnd;

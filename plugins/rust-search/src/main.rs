@@ -208,17 +208,39 @@ fn records(b: &[u8], mut f: impl FnMut(u64, u64, u32, String)) {
     while off + 60 <= b.len() {
         let r = &b[off..];
         let len = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
-        if len == 0 || u16::from_le_bytes(r[4..6].try_into().unwrap()) != 2 {
-            break; // only V2 (NTFS)
+        if len < 60 || off + len > b.len() || u16::from_le_bytes(r[4..6].try_into().unwrap()) != 2 {
+            break; // truncated/invalid or not V2 (NTFS)
         }
         let frn = u64::from_le_bytes(r[8..16].try_into().unwrap());
         let parent = u64::from_le_bytes(r[16..24].try_into().unwrap());
         let reason = u32::from_le_bytes(r[40..44].try_into().unwrap());
         let nlen = u16::from_le_bytes(r[56..58].try_into().unwrap()) as usize;
         let noff = u16::from_le_bytes(r[58..60].try_into().unwrap()) as usize;
-        let name: Vec<u16> = r[noff..noff + nlen].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        f(frn, parent, reason, String::from_utf16_lossy(&name));
+        if noff + nlen <= len {
+            let name: Vec<u16> = r[noff..noff + nlen].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            f(frn, parent, reason, String::from_utf16_lossy(&name));
+        }
         off += len;
+    }
+}
+
+fn set_bg_thread_priority(io_bg: bool) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> HANDLE;
+        fn SetThreadPriority(h: HANDLE, priority: i32) -> i32;
+    }
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
+    const THREAD_MODE_BACKGROUND_END: i32 = 0x0002_0000;
+    unsafe {
+        let t = GetCurrentThread();
+        if io_bg {
+            SetThreadPriority(t, THREAD_MODE_BACKGROUND_BEGIN);
+        } else {
+            SetThreadPriority(t, THREAD_MODE_BACKGROUND_END);
+            SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+        }
     }
 }
 
@@ -248,6 +270,9 @@ fn scan(h: HANDLE) -> Result<Index, String> {
             } else { Err(format!("FSCTL_ENUM_USN_DATA failed (error {e})")) };
         }
         let b = &buf[..n as usize];
+        if b.len() < 8 {
+            break;
+        }
         med.StartFileReferenceNumber = u64::from_le_bytes(b[..8].try_into().unwrap());
         records(b, |frn, parent, _, name| {
             idx.insert(frn, parent, &name);
@@ -300,6 +325,9 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
             return;
         }
         let b = &buf[..n as usize];
+        if b.len() < 8 {
+            continue;
+        }
         usn = i64::from_le_bytes(b[..8].try_into().unwrap());
         let mut g = sh.lock().unwrap();
         if b.len() > 8 {
@@ -319,6 +347,7 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
 /// Keeps the index current for as long as the process lives: follow the journal, and when that is no
 /// longer possible (journal wrapped past us, recreated, volume remounted) index from scratch and go on.
 fn maintain(drive: char, sh: Arc<Mutex<Shared>>) {
+    set_bg_thread_priority(false); // keep USN journal tailing below normal so games never stutter during shader/file writes
     loop {
         tail(drive, &sh);
         thread::sleep(Duration::from_secs(10)); // never spin if the failure is persistent
@@ -502,7 +531,9 @@ fn serve(drive: char, allow: Option<String>) -> Result<(), String> {
     thread::spawn(move || maintain(drive, sh));
     let sh = idx.clone();
     thread::spawn(move || loop {
+        set_bg_thread_priority(true); // low CPU & disk I/O priority while writing the snapshot so games never hitch
         save(drive, &sh);
+        set_bg_thread_priority(false);
         thread::sleep(SAVE_EVERY);
     });
 
@@ -858,5 +889,19 @@ mod tests {
         assert_eq!(p[1], "C:\\Users\\Docs\\Report Final.TXT");
         assert_eq!(query(&idx, 'C', &["report".into(), "txt".into()]).1, 1);
         assert_eq!(query(&idx, 'C', &["nope".into()]).1, 0);
+    }
+
+    #[test]
+    fn records_ignores_truncated_or_out_of_bounds_entries() {
+        let mut bad = vec![0u8; 80];
+        bad[8..12].copy_from_slice(&64u32.to_le_bytes()); // len = 64
+        bad[12..14].copy_from_slice(&2u16.to_le_bytes()); // V2
+        bad[8 + 56..8 + 58].copy_from_slice(&200u16.to_le_bytes()); // nlen way past len
+        bad[8 + 58..8 + 60].copy_from_slice(&60u16.to_le_bytes());
+        let mut got = 0;
+        records(&bad, |_, _, _, _| got += 1);
+        assert_eq!(got, 0);
+        records(&[0u8; 4], |_, _, _, _| got += 1);
+        assert_eq!(got, 0);
     }
 }

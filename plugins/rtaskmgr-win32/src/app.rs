@@ -100,7 +100,7 @@ pub enum Act {
     Efficiency,
     Suspend(bool),
     Prio(u32),
-    Affinity(bool),
+    Affinity(sys::AffinityMode),
     OpenDir,
     CopyCmd,
     RuleLower,
@@ -695,24 +695,40 @@ impl App {
     }
 
     /// Из таймера: Windows-таймер может тикать чаще заданного, поэтому режем частоту.
+    /// Когда окно скрыто в трее или свёрнуто, снижаем частоту опроса, чтобы не нагружать ЦП в играх.
     pub fn on_timer(&self) {
-        if self.last_tick.get().elapsed() >= Duration::from_millis(900) {
+        let visible = self.win.visible() && self.win.handle.hwnd().is_some_and(|h| unsafe { IsIconic(h) == 0 });
+        let min_gap = if visible {
+            Duration::from_millis(900)
+        } else if !self.data.borrow().rules.is_empty() || crate::boost::is_busy() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(5)
+        };
+        if self.last_tick.get().elapsed() >= min_gap {
             self.last_tick.set(Instant::now());
-            self.tick();
+            self.tick_mode(visible);
         }
     }
 
     pub fn tick(&self) {
+        self.tick_mode(true);
+    }
+
+    fn tick_mode(&self, visible: bool) {
         {
             let ui = self.ui.borrow();
-            self.data.borrow_mut().want_gpu_temp = ui.page == Page::Performance && matches!(ui.perf_sel, PerfKind::Gpu(_));
+            self.data.borrow_mut().want_gpu_temp = visible && ui.page == Page::Performance && matches!(ui.perf_sel, PerfKind::Gpu(_));
         }
-        let mut notes = self.data.borrow_mut().refresh();
+        let mut notes = self.data.borrow_mut().refresh_with_visible(visible);
         notes.extend(crate::boost::take_done()); // фоновые действия страницы «Ускорение»
         if !notes.is_empty() {
             let msg = notes.join("; ");
             self.toast(&msg);
             self.tray.show(&msg, Some(t!("Диспетчер задач", "Task Manager")), None, None);
+        }
+        if !visible {
+            return;
         }
         {
             let (page, ticks) = (self.ui.borrow().page, self.data.borrow().ticks);
@@ -816,7 +832,15 @@ impl App {
                     MI::Item(t!("Возобновить", "Resume"), Act::Suspend(false)),
                     MI::Sep,
                     MI::Sub(t!("Приоритет", "Priority"), sys::PRIORITIES.iter().map(|p| MI::Item(p.0, Act::Prio(p.1))).collect()),
-                    MI::Sub(t!("Ядра процессора", "CPU cores"), vec![MI::Item(t!("Все ядра", "All cores"), Act::Affinity(false)), MI::Item(t!("Только половина ядер", "Half of the cores only"), Act::Affinity(true))]),
+                    MI::Sub(
+                        t!("Ядра процессора", "CPU cores"),
+                        vec![
+                            MI::Item(t!("Все ядра", "All cores"), Act::Affinity(sys::AffinityMode::All)),
+                            MI::Item(t!("Первая половина (CCD0 / P-ядра)", "First half (CCD0 / P-cores)"), Act::Affinity(sys::AffinityMode::FirstHalf)),
+                            MI::Item(t!("Без ядра 0 (анти-статтер в играх)", "Exclude Core 0 (anti-stutter)"), Act::Affinity(sys::AffinityMode::NoCore0)),
+                            MI::Item(t!("Только чётные ядра (без SMT/HT)", "Even cores only (no SMT/HT)"), Act::Affinity(sys::AffinityMode::EvenCores)),
+                        ],
+                    ),
                     MI::Sep,
                     MI::Item(t!("Открыть расположение файла", "Open file location"), Act::OpenDir),
                     MI::Item(t!("Копировать командную строку", "Copy command line"), Act::CopyCmd),
@@ -1048,7 +1072,7 @@ impl App {
                 }
                 report(if on { t!("Режим эффективности включён", "Efficiency mode on") } else { t!("Режим эффективности выключен", "Efficiency mode off") }, ok.len());
             }
-            Act::Affinity(half) => report(t!("Привязка к ядрам", "Core affinity"), pids.iter().filter(|&&p| sys::set_affinity(p, half)).count()),
+            Act::Affinity(mode) => report(t!("Привязка к ядрам", "Core affinity"), pids.iter().filter(|&&p| sys::set_affinity(p, mode)).count()),
             Act::OpenDir => {
                 let d = self.data.borrow();
                 let path = pids.iter().find_map(|&p| d.procs.iter().find(|x| x.pid == p).and_then(|x| x.exe.clone()));
@@ -1238,6 +1262,8 @@ impl App {
                 SetForegroundWindow(h);
             }
         }
+        self.last_tick.set(Instant::now());
+        self.tick();
     }
 
     pub fn quit(&self) {
@@ -1294,7 +1320,7 @@ fn build_menu(items: &[MI], acts: &mut Vec<Act>) -> HMENU {
 
 /// Тёмные/светлые системные меню (недокументированные функции uxtheme: 135 — SetPreferredAppMode, 136 — FlushMenuThemes).
 pub fn set_menu_theme(dark: bool) {
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
+    use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryW};
     unsafe {
         let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
         if lib.is_null() {
@@ -1310,6 +1336,7 @@ pub fn set_menu_theme(dark: bool) {
             let f: extern "system" fn() = std::mem::transmute(flush);
             f();
         }
+        FreeLibrary(lib);
     }
 }
 

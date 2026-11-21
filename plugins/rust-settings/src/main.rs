@@ -93,6 +93,11 @@ enum Op {
     Pac,    // asks for the proxy script address
     Bt,     // Bluetooth radio
     Air,    // airplane mode
+    AutoGame,
+    WinLock,
+    TimerBoost,
+    RawMouse,
+    NoStickyKey,
 }
 
 #[derive(Clone)]
@@ -106,6 +111,7 @@ enum Cmd {
     BtScan,
     Check,
     Install,
+    UnlockUltimate,
 }
 
 const CONFIRM_SECS: u32 = 15;
@@ -196,7 +202,18 @@ fn gb(bytes: u64) -> String {
 }
 
 /// Words that select each page, in the order of `pages()`.
-const PAGE_KEYS: [&[&str]; 9] = [&["display"], &["sound"], &["power", "battery", "storage"], &["network", "wifi", "ethernet"], &["bluetooth", "airplane"], &["apps"], &["update"], &["personal", "color", "theme"], &["about"]];
+const PAGE_KEYS: [&[&str]; 10] = [
+    &["display"],
+    &["sound"],
+    &["power", "battery", "storage"],
+    &["network", "wifi", "ethernet"],
+    &["bluetooth", "airplane"],
+    &["apps"],
+    &["update"],
+    &["personal", "color", "theme"],
+    &["about"],
+    &["gaming", "game"],
+];
 
 /// The page a name or an ms-settings: address points at; the first page when nothing matches.
 fn page_for(arg: &str) -> usize {
@@ -418,6 +435,71 @@ const NET_PAGE: usize = 3;
 const BT_PAGE: usize = 4;
 const APPS_PAGE: usize = 5;
 const WU_PAGE: usize = 6;
+const GAME_PAGE: usize = 9;
+
+fn auto_game_on() -> Option<bool> {
+    Some(winrust_common::gaming::auto_game())
+}
+
+fn win_lock_on() -> Option<bool> {
+    Some(winrust_common::gaming::win_lock())
+}
+
+fn timer_boost_on() -> Option<bool> {
+    Some(winrust_common::gaming::timer_boost())
+}
+
+/// True when Windows mouse acceleration ("Enhance pointer precision") is off.
+fn raw_mouse_on() -> Option<bool> {
+    let mut p = [0i32; 3];
+    (unsafe { SystemParametersInfoW(SPI_GETMOUSE, 0, p.as_mut_ptr() as _, 0) } != 0).then_some(p[2] == 0)
+}
+
+fn set_raw_mouse(raw: bool) {
+    let mut p = if raw { [0i32, 0, 0] } else { [6i32, 10, 1] };
+    unsafe { SystemParametersInfoW(SPI_SETMOUSE, 0, p.as_mut_ptr() as _, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE) };
+}
+
+/// True when the Shift x 5 Sticky Keys popup hotkey is disabled (so spamming Shift in games never interrupts).
+fn sticky_hotkey_off() -> Option<bool> {
+    use windows_sys::Win32::UI::Accessibility::STICKYKEYS;
+    let mut k = STICKYKEYS { cbSize: size_of::<STICKYKEYS>() as u32, dwFlags: 0 };
+    (unsafe { SystemParametersInfoW(SPI_GETSTICKYKEYS, k.cbSize, &mut k as *mut _ as _, 0) } != 0).then_some(k.dwFlags & 0x0004 == 0)
+}
+
+fn set_sticky_hotkey_off(off: bool) {
+    use windows_sys::Win32::UI::Accessibility::STICKYKEYS;
+    const SKF_HOTKEYACTIVE: u32 = 0x0004;
+    let mut k = STICKYKEYS { cbSize: size_of::<STICKYKEYS>() as u32, dwFlags: 0 };
+    unsafe {
+        if SystemParametersInfoW(SPI_GETSTICKYKEYS, k.cbSize, &mut k as *mut _ as _, 0) != 0 {
+            k.dwFlags = if off { k.dwFlags & !SKF_HOTKEYACTIVE } else { k.dwFlags | SKF_HOTKEYACTIVE };
+            SystemParametersInfoW(SPI_SETSTICKYKEYS, k.cbSize, &mut k as *mut _ as _, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        }
+    }
+}
+
+fn gaming_rows() -> Vec<Row> {
+    let head = |s: &str| Row::Header(s.into());
+    let ult = if power::has_ultimate_performance() {
+        t!("Доступна", "Available")
+    } else {
+        t!("Разблокировать", "Unlock")
+    };
+    vec![
+        head(t!("Режим «Игра» WinRust", "WinRust Game Mode")),
+        Row::Switch(t!("Авторежим «Игра» (приоритет, 0,5 мс, питание)", "Auto Game Mode (priority, 0.5 ms timer, power)").into(), auto_game_on, Op::AutoGame),
+        Row::Switch(t!("Блокировать клавишу Win в играх (Win+Shift+G)", "Lock Win key in fullscreen games (Win+Shift+G)").into(), win_lock_on, Op::WinLock),
+        Row::Switch(t!("Точный таймер 0,5 мс в полноэкранных играх", "0.5 ms high-precision timer in fullscreen games").into(), timer_boost_on, Op::TimerBoost),
+        head(t!("Windows и ввод", "Windows & input")),
+        toggle_row(t!("Игровой режим Windows", "Windows Game Mode"), r"Software\Microsoft\GameBar", "AutoGameModeEnabled", 1, 1),
+        toggle_row(t!("Отключить фоновую запись Game DVR", "Disable Game DVR background recording"), r"System\GameConfigStore", "GameDVR_Enabled", 0, 1),
+        Row::Switch(t!("Прямой ввод мыши (без ускорения)", "Raw mouse input (disable pointer acceleration)").into(), raw_mouse_on, Op::RawMouse),
+        Row::Switch(t!("Отключить окно «Залипание клавиш» (5×Shift)", "Disable Sticky Keys Shift×5 popup").into(), sticky_hotkey_off, Op::NoStickyKey),
+        head(t!("Питание", "Power")),
+        Row::Item(t!("Схема «Максимальная производительность»", "Ultimate Performance power plan").into(), ult.into(), Cmd::UnlockUltimate),
+    ]
+}
 
 thread_local! { static EXPANDED: RefCell<Option<String>> = const { RefCell::new(None) } } // the adapter whose details show
 thread_local! { static RADIO: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) } }
@@ -643,6 +725,7 @@ fn dynamic(page: usize, apps: &mut Option<Vec<ext::App>>) -> Option<Vec<Row>> {
         BT_PAGE => Some(bt_rows()),
         APPS_PAGE => Some(apps_rows(apps.get_or_insert_with(ext::programs))),
         WU_PAGE => Some(wu_rows()),
+        GAME_PAGE => Some(gaming_rows()),
         _ => None,
     }
 }
@@ -684,6 +767,7 @@ fn pages() -> Vec<Page> {
                 Row::Info(t!("Сборка", "Build").into(), reg("CurrentBuild")),
             ],
         },
+        Page { title: t!("Игры", "Gaming").into(), rows: gaming_rows() },
     ]
 }
 
@@ -719,7 +803,7 @@ fn theme() -> Theme {
 use winrust_common::style::rgb;
 
 /// Icon and tile colour of each page, in the order of `pages()` (the coloured squares of macOS' System Settings).
-const ICONS: [(&str, u32); 9] = [
+const ICONS: [(&str, u32); 10] = [
     ("\u{E7F4}", rgb(10, 132, 255)),
     ("\u{E767}", rgb(255, 55, 95)),
     ("\u{E7E8}", rgb(48, 209, 88)),
@@ -729,6 +813,7 @@ const ICONS: [(&str, u32); 9] = [
     ("\u{E895}", rgb(52, 199, 89)),
     ("\u{E771}", rgb(191, 90, 242)),
     ("\u{E946}", rgb(142, 142, 147)),
+    ("\u{E7FC}", rgb(148, 82, 255)),
 ];
 
 /// Fills `r`; `d` is the corner diameter (0 = square corners). Rounded shapes go through GDI+ for smooth edges;
@@ -1267,6 +1352,11 @@ unsafe fn display_or_mute(_hwnd: HWND, op: Op) {
         }
         Op::Proxy => unsafe { open_prompt(_hwnd, Prompt::Proxy(false)) },
         Op::Pac => unsafe { open_prompt(_hwnd, Prompt::Proxy(true)) },
+        Op::AutoGame => winrust_common::gaming::set_auto_game(!winrust_common::gaming::auto_game()),
+        Op::WinLock => winrust_common::gaming::set_win_lock(!winrust_common::gaming::win_lock()),
+        Op::TimerBoost => winrust_common::gaming::set_timer_boost(!winrust_common::gaming::timer_boost()),
+        Op::RawMouse => set_raw_mouse(!raw_mouse_on().unwrap_or(false)),
+        Op::NoStickyKey => set_sticky_hotkey_off(!sticky_hotkey_off().unwrap_or(false)),
         _ => {}
     }
 }
@@ -1399,6 +1489,15 @@ unsafe fn run_cmd(hwnd: HWND, label: &str, cmd: Cmd) {
                     Cmd::Install => {
                         wu::install(ping);
                         ping();
+                    }
+                    Cmd::UnlockUltimate => {
+                        if power::has_ultimate_performance() {
+                            say(t!("Схема уже доступна в «Питание и диски»", "Already available under 'Power & storage'").into());
+                        } else if power::unlock_ultimate_performance() {
+                            say(t!("«Максимальная производительность» добавлена — выберите её в «Питание и диски»", "Ultimate Performance unlocked - pick it under 'Power & storage'").into());
+                        } else {
+                            say(t!("Не удалось добавить схему (powercfg)", "Could not unlock the power plan (powercfg)").into());
+                        }
                     }
                     Cmd::Uninstall(_) | Cmd::BtUnpair(_) => {}
                 }
@@ -2078,5 +2177,6 @@ mod tests {
         assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
         assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
         assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
+        assert_eq!((page_for("gaming"), page_for("ms-settings:gaming-gamemode")), (GAME_PAGE, GAME_PAGE));
     }
 }

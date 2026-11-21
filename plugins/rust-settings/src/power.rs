@@ -104,6 +104,27 @@ pub fn set_plan(i: usize) {
     }
 }
 
+/// True if an Ultimate Performance power plan is already present in Windows.
+pub fn has_ultimate_performance() -> bool {
+    const ULT: GUID = GUID { data1: 0xe9a42b02, data2: 0xd5df, data3: 0x448d, data4: [0xaa, 0x00, 0x03, 0xf1, 0x47, 0x49, 0xeb, 0x61] };
+    schemes().iter().any(|g| {
+        same(g, &ULT) || {
+            let n = name_of(g).to_lowercase();
+            n.contains("ultimate performance") || n.contains("максимальная производительность")
+        }
+    })
+}
+
+/// Unlocks Windows' hidden Ultimate Performance power plan (`powercfg -duplicatescheme`).
+pub fn unlock_ultimate_performance() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("powercfg.exe")
+        .args(["-duplicatescheme", "e9a42b02-d5df-448d-aa00-03f14749eb61"])
+        .creation_flags(0x0800_0000)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Screen-off and sleep timeouts of the active plan (seconds; 0 = never), written for mains and battery alike.
 #[derive(Clone, Copy)]
 pub enum Timeout {

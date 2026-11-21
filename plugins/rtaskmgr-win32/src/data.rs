@@ -231,6 +231,12 @@ impl Data {
 
     /// Один такт обновления. Возвращает сообщения от правил (их показывает интерфейс).
     pub fn refresh(&mut self) -> Vec<String> {
+        self.refresh_with_visible(true)
+    }
+
+    /// Такт обновления. Когда окно скрыто в трее (`visible = false`), пропускаем опрос окон, служб и температуры GPU,
+    /// чтобы диспетчер не создавал лишней нагрузки во время игр.
+    pub fn refresh_with_visible(&mut self, visible: bool) -> Vec<String> {
         let dt = self.prev.elapsed().as_secs_f64().clamp(0.3, 5.0);
         self.prev = Instant::now();
         self.ticks += 1;
@@ -266,8 +272,10 @@ impl Data {
             (self.dpc_pct, self.intr_pct) = sys::dpc_share(a, b);
         }
         self.cpu_times = now;
-        self.hung = sys::hung_windows();
-        if self.want_gpu_temp || self.cfg.gpu_temp_always {
+        if visible {
+            self.hung = sys::hung_windows();
+        }
+        if (visible && self.want_gpu_temp) || self.cfg.gpu_temp_always {
             for g in self.gpus.iter_mut() {
                 g.temp = gpu::temperature(g.adapter.luid).or_else(|| {
                     // запасной путь для NVIDIA, если драйвер не отдаёт температуру через D3DKMT
@@ -290,14 +298,14 @@ impl Data {
         if self.ticks % 30 == 1 {
             self.disk_total = disk_capacity();
         }
-        if self.ticks % 5 == 1 {
+        if visible && self.ticks % 5 == 1 {
             self.svcs = sys::services();
             self.svc_pids.clear();
             for s in self.svcs.iter().filter(|s| s.pid != 0) {
                 self.svc_pids.entry(s.pid).or_default().push(s.name.clone());
             }
         }
-        let titles = if self.ticks % 2 == 1 { Some(sys::window_titles()) } else { None };
+        let titles = if visible && self.ticks % 2 == 1 { Some(sys::window_titles()) } else { None };
 
         // ---- подозрительность ----
         let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());

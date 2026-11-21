@@ -407,7 +407,11 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
     }
     match m {
         WM_HOTKEY => {
-            if IsWindowVisible(h) != 0 && st(|s| s.ta) > 0.0 { hide(h) } else { show(h) }
+            if IsWindowVisible(h) != 0 && st(|s| s.ta) > 0.0 {
+                hide(h);
+            } else if !(winrust_common::gaming::should_lock_win_key() && winrust_common::gaming::is_foreground_fullscreen()) {
+                show(h);
+            }
             0
         }
         WM_ACTIVATE => {

@@ -994,12 +994,52 @@ fn drag_log(s: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) { let _ = writeln!(f, "{s}"); }
 }
 
-/// Address bar subclass: Enter / Esc go to the main window, everything else is the normal edit control.
+/// Computes the new `(start_utf16, end_utf16)` selection to delete for Ctrl+Backspace at UTF-16 offset `caret` in `buf`.
+fn prev_word_range(buf: &[u16], caret: usize) -> (usize, usize) {
+    let end = caret.min(buf.len());
+    let mut i = end;
+    let is_sep = |c: u16| matches!(c as u8 as char, ' ' | '\t' | '\\' | '/' | '.' | '-' | '_' | ':') && c < 128;
+    while i > 0 && is_sep(buf[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && !is_sep(buf[i - 1]) {
+        i -= 1;
+    }
+    (i, end)
+}
+
+/// Address bar subclass: Enter / Esc go to the main window, Ctrl+A selects all, Ctrl+Backspace deletes a word/segment cleanly.
 unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    const EM_GETSEL: u32 = 0x00B0;
+    const EM_SETSEL: u32 = 0x00B1;
+    const EM_REPLACESEL: u32 = 0x00C2;
     unsafe {
         if matches!(wp, 13 | 27) && matches!(m, WM_KEYDOWN | WM_CHAR) {
             if m == WM_KEYDOWN { PostMessageW(GetAncestor(h, GA_ROOT), WM_GO, wp, 0); }
             return 0; // WM_CHAR swallowed so there is no beep
+        }
+        // Ctrl+A selects the whole address bar without a beep
+        if m == WM_KEYDOWN && wp == b'A' as usize && GetKeyState(VK_CONTROL as i32) < 0 {
+            SendMessageW(h, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if m == WM_CHAR && wp == 1 {
+            return 0;
+        }
+        // Ctrl+Backspace in Win32 EDIT sends WM_CHAR 0x7F (DEL box glyph): delete the previous word/path segment instead
+        if m == WM_CHAR && wp == 0x7F {
+            let (mut s, mut e) = (0u32, 0u32);
+            SendMessageW(h, EM_GETSEL, &mut s as *mut u32 as usize, &mut e as *mut u32 as isize);
+            if s == e && s > 0 {
+                let len = GetWindowTextLengthW(h).max(0) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+                let (a, b) = prev_word_range(&buf[..got], s as usize);
+                SendMessageW(h, EM_SETSEL, a, b as isize);
+            }
+            let empty = [0u16];
+            SendMessageW(h, EM_REPLACESEL, 1, empty.as_ptr() as isize);
+            return 0;
         }
         CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(EDIT_OLD.load(std::sync::atomic::Ordering::Relaxed)), h, m, wp, lp)
     }
@@ -1439,5 +1479,18 @@ mod search_tests {
         assert_eq!(super::flip_layout("сфкпщ"), "cargo");
         assert_eq!(super::flip_layout("ljrevtyns"), "документы");
         assert_eq!(super::flip_layout("Ыфму"), "Save");
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_path_segment_or_word() {
+        let u = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let p = u(r"C:\Users\Player\Games\");
+        let (a, b) = super::prev_word_range(&p, p.len());
+        assert_eq!(String::from_utf16_lossy(&p[..a]), r"C:\Users\Player\");
+        assert_eq!(b, p.len());
+        let q = u("? cyber punk");
+        let (a2, b2) = super::prev_word_range(&q, q.len());
+        assert_eq!(String::from_utf16_lossy(&q[..a2]), "? cyber ");
+        assert_eq!(b2, q.len());
     }
 }
