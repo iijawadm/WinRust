@@ -1,5 +1,6 @@
-//! Replacement for desktop-hotkeys.ps1: Win+1/2/3 -> desktop 1/2/3, Win+` -> previous desktop, Win+E -> our file manager,
-//! Win+D -> show desktop, Win+I -> Settings. Win+E/D/I are done here, not left to Explorer: with topbar (and rust-explorer)
+//! Replacement for desktop-hotkeys.ps1: Win+1/2/3 -> desktop 1/2/3 (Win+Ctrl+1..3 while topbar is running,
+//! so Win+1..9 open taskbar apps), Win+` -> previous desktop, Win+E -> Windows File Explorer,
+//! Win+D -> show desktop, Win+I -> Settings. Win+E/D/I are done here, not left to Explorer: with topbar (and rs-shell)
 //! Explorer's taskbar is hidden or gone and it stops answering them although it still holds the hotkeys.
 //! No undocumented COM: the current desktop comes from the registry, switching sends Ctrl+Win+Left/Right
 //! (Win is already held by the user). shortcut: relies on the system shortcuts being enabled.
@@ -39,16 +40,11 @@ fn send(keys: &[INPUT]) {
     unsafe { SendInput(keys.len() as u32, keys.as_ptr(), size_of::<INPUT>() as i32) };
 }
 
-/// Win+E: rust-explorer from the user's own folder (where updates land without admin), else next to us, else Explorer.
+/// Win+E: launch Windows File Explorer independently (never hijacked by rust-explorer).
 /// Null std handles: this process has no console (FreeConsole) and a child that inherits the invalid ones fails to start.
 fn open_files() {
-    use std::{path::PathBuf, process::{Command, Stdio}};
-    let mine = std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join(r"plugin-launcher\bin\rust-explorer.exe"));
-    let beside = std::env::current_exe().ok().map(|e| e.with_file_name("rust-explorer.exe"));
-    let installed = std::env::var_os("ProgramFiles").map(|b| PathBuf::from(b).join(r"rust-explorer\rust-explorer.exe"));
-    // the newest copy wins: a stale one in the user's folder must not shadow the installed one (two bar buttons, old UI)
-    let exe = [installed, mine, beside].into_iter().flatten().filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p))).max().map(|(_, p)| p).unwrap_or_else(|| "explorer.exe".into());
-    let _ = Command::new(exe).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    use std::process::{Command, Stdio};
+    let _ = Command::new("explorer.exe").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
 fn open_settings() {
@@ -82,9 +78,9 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             HELD.store(0, Relaxed); // also when Win was let go first
         }
         let act = win_action(k.vkCode);
-        let id = match k.vkCode { 0x31..=0x33 => Some(k.vkCode as usize - 0x31), 0xC0 => Some(usize::MAX), _ => None };
-        // Check the key code BEFORE GetAsyncKeyState: avoids 2 syscalls on every normal/game keystroke (WASD, etc.).
-        if (act.is_some() || id.is_some()) && k.flags & LLKHF_INJECTED == 0 {
+        let maybe_desk = matches!(k.vkCode, 0x31..=0x33 | 0xC0);
+        // Check the key code BEFORE GetAsyncKeyState / FindWindowW: avoids syscalls on every normal/game keystroke.
+        if (act.is_some() || maybe_desk) && k.flags & LLKHF_INJECTED == 0 {
             let win = unsafe { (GetAsyncKeyState(VK_LWIN as i32) | GetAsyncKeyState(VK_RWIN as i32)) as u16 & 0x8000 != 0 };
             if win {
                 // During a fullscreen game with Win-key lock active, swallow Win+D/E/I/1-3/` without leaving the game.
@@ -102,13 +98,23 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     }
                     return 1;
                 }
-                if let Some(id) = id {
-                    if w == WM_KEYDOWN as usize && HELD.swap(k.vkCode, Relaxed) != k.vkCode {
-                        // unassigned key tap stops Win release from opening Start; switching runs off the hook thread
-                        send(&[tap(0xE8, false), tap(0xE8, true)]);
-                        std::thread::spawn(move || go(if id == usize::MAX { PREV.load(Relaxed) } else { id }));
+                if maybe_desk {
+                    // with the topbar running Win+1..9 belong to its app buttons: desktops are Win+Ctrl+1..3 then
+                    let bar = unsafe { !FindWindowW("topbar\0".encode_utf16().collect::<Vec<u16>>().as_ptr(), std::ptr::null()).is_null() };
+                    let ctrl = unsafe { GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000 != 0 };
+                    let id = match k.vkCode {
+                        0x31..=0x33 if !bar || ctrl => Some(k.vkCode as usize - 0x31),
+                        0xC0 => Some(usize::MAX),
+                        _ => None,
+                    };
+                    if let Some(id) = id {
+                        if w == WM_KEYDOWN as usize && HELD.swap(k.vkCode, Relaxed) != k.vkCode {
+                            // unassigned key tap stops Win release from opening Start; switching runs off the hook thread
+                            send(&[tap(0xE8, false), tap(0xE8, true)]);
+                            std::thread::spawn(move || go(if id == usize::MAX { PREV.load(Relaxed) } else { id }));
+                        }
+                        return 1;
                     }
-                    return 1;
                 }
             }
         }

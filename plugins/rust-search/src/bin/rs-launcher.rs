@@ -11,6 +11,8 @@
 mod common;
 #[path = "../regsweep.rs"]
 mod regsweep;
+#[path = "../run.rs"]
+mod run;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -124,6 +126,9 @@ struct St {
     busy: bool,             // a dialog is up: losing focus must not close the card
     menu: Option<MenuSt>,
     purge: Option<Purge>,
+    run: bool,              // Run mode (Win+R through the topbar): rows are commands, Enter starts the selected one
+    run_src: Vec<run::Src>, // where each row of `results` comes from, in Run mode
+    programs: Vec<String>,  // what Run can start by name (PATH, App Paths): read when Run mode opens
 }
 thread_local!(static ST: RefCell<St> = RefCell::new(St::default()));
 
@@ -264,10 +269,27 @@ fn labels(path: &str) -> (String, String) {
     }
 }
 
+/// (title, subtitle) for a Run mode row.
+fn run_labels(line: &str, src: Option<run::Src>) -> (String, String) {
+    use winrust_common::t;
+    let desc = |i: usize| t!(run::KNOWN[i].1, run::KNOWN[i].2);
+    let known = run::describe(line).map(desc); // a typed or recent command we know gets its description too
+    match src {
+        Some(run::Src::Typed) => (line.to_string(), known.unwrap_or(t!("Выполнить", "Run")).into()),
+        Some(run::Src::Folder) => {
+            let (dir, name) = line.trim_end_matches('\\').rsplit_once('\\').unwrap_or(("", line));
+            (format!("{name}{}", if line.ends_with('\\') { "\\" } else { "" }), dir.to_string())
+        }
+        Some(run::Src::Known(i)) => (line.to_string(), desc(i).into()),
+        Some(run::Src::Program) => (line.to_string(), t!("Программа", "Program").into()),
+        _ => (line.to_string(), known.map_or(t!("Недавнее", "Recent").into(), |d| format!("{}  \u{00B7}  {d}", t!("Недавнее", "Recent")))),
+    }
+}
+
 fn target_height(s: &St) -> f32 {
     let p = |v: i32| v as f32 * s.scale;
     let rows = s.results.len().min(MAX_ROWS).max(1) as i32;
-    let base = if s.text.is_empty() { p(INPUT_H) } else { p(INPUT_H + PAD + rows * ROW_H + if s.results.is_empty() { PAD } else { FOOT_H }) };
+    let base = if s.text.is_empty() && s.results.is_empty() { p(INPUT_H) } else { p(INPUT_H + PAD + rows * ROW_H + if s.results.is_empty() { PAD } else { FOOT_H }) };
     if s.purge.is_some() {
         p(INPUT_H + PAD + PANEL_H)
     } else if s.menu.is_some() {
@@ -281,7 +303,11 @@ unsafe fn start_anim(h: HWND) {
     SetTimer(h, T_ANIM, 15, None);
 }
 
-unsafe fn show(h: HWND) {
+unsafe fn show(h: HWND, run: bool) {
+    if run {
+        let p = run::programs(); // a few thousand names, ~10 ms: fresh on every open, so new installs show up
+        st(|s| s.programs = p);
+    }
     let (x, y) = {
         let mut pt: POINT = zeroed();
         GetCursorPos(&mut pt);
@@ -294,7 +320,9 @@ unsafe fn show(h: HWND) {
     };
     st(|s| {
         s.text.clear();
-        s.results.clear();
+        s.run = run;
+        // Run mode opens on the recent history; search starts empty
+        (s.results, s.run_src) = if run { run::suggest("", &run::history(), &[]).into_iter().unzip() } else { (vec![], vec![]) };
         (s.rename, s.menu) = (None, None);
         if matches!(s.purge, Some(Purge::Confirm { .. })) {
             s.purge = None;
@@ -390,12 +418,38 @@ unsafe fn apply_results(h: HWND, res: Vec<String>) {
 }
 
 unsafe fn open(h: HWND, reveal: bool) {
+    if st(|s| s.run) {
+        return run_selected(h, reveal && GetKeyState(VK_SHIFT as i32) < 0); // Ctrl+Shift+Enter: as administrator
+    }
     let Some(p) = st(|s| if s.rename.is_some() { None } else { s.results.get(s.sel).cloned() }) else { return };
     hide(h);
     if reveal {
-        ShellExecuteW(null_mut(), wide("open").as_ptr(), wide("explorer.exe").as_ptr(), wide(&format!("/select,\"{p}\"")).as_ptr(), null(), SW_SHOWNORMAL);
+        winrust_common::reveal(&p);
     } else {
         ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(&p).as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Run mode: starts the selected row (the typed text unless another row was picked), from the user's folder
+/// like the Windows Run box. Only what started goes into the history.
+unsafe fn run_selected(h: HWND, admin: bool) {
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW};
+    let Some(line) = st(|s| s.results.get(s.sel).cloned()) else { return };
+    let (file, args) = run::split_cmd(&run::expand(&line), |p| std::path::Path::new(p).exists());
+    hide(h);
+    let (verb, file_w, args_w, dir_w) = (wide(if admin { "runas" } else { "open" }), wide(&file), wide(&args), wide(&std::env::var("USERPROFILE").unwrap_or_default()));
+    let mut ei: SHELLEXECUTEINFOW = zeroed();
+    ei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    ei.fMask = SEE_MASK_FLAG_NO_UI;
+    ei.lpVerb = verb.as_ptr();
+    ei.lpFile = file_w.as_ptr();
+    ei.lpParameters = if args.is_empty() { null() } else { args_w.as_ptr() };
+    ei.lpDirectory = dir_w.as_ptr();
+    ei.nShow = SW_SHOWNORMAL;
+    if ShellExecuteExW(&mut ei) != 0 {
+        run::remember(&line);
+    } else if GetLastError() != ERROR_CANCELLED {
+        note(&winrust_common::tf!("Не удалось найти «{}». Проверьте имя и попробуйте ещё раз.", "Windows cannot find '{}'. Make sure you typed the name correctly, and then try again.", file), MB_ICONERROR);
     }
 }
 
@@ -457,6 +511,11 @@ unsafe fn text_changed(h: HWND) {
     QUERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst); // any answer still in flight is for older text
     if st(|s| s.rename.is_some()) {
         // editing a file name: the results must stay put
+    } else if st(|s| s.run) {
+        // Run mode: history and folder entries are local and quick, no service to ask
+        let (res, src): (Vec<_>, Vec<_>) = st(|s| run::suggest(&String::from_utf16_lossy(&s.text), &run::history(), &s.programs)).into_iter().unzip();
+        apply_results(h, res);
+        st(|s| s.run_src = src);
     } else if st(|s| s.text.is_empty()) {
         KillTimer(h, T_DEBOUNCE);
         st(|s| {
@@ -505,10 +564,12 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
     }
     match m {
         WM_HOTKEY => {
-            if IsWindowVisible(h) != 0 && st(|s| s.ta) > 0.0 {
+            // id 1: our Alt+Space; 2: the topbar asks for Run mode (Win+R). The same key again closes, the other switches.
+            let run = wp == 2;
+            if IsWindowVisible(h) != 0 && st(|s| s.ta > 0.0 && s.run == run) {
                 hide(h);
             } else if !(winrust_common::gaming::should_lock_win_key() && winrust_common::gaming::is_foreground_fullscreen()) {
-                show(h);
+                show(h, run);
             }
             0
         }
@@ -594,6 +655,13 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                 VK_NEXT => move_sel(MAX_ROWS as isize),
                 VK_PRIOR => move_sel(-(MAX_ROWS as isize)),
                 VK_BACK => backspace(h, ctrl),
+                VK_TAB if st(|s| s.run) => {
+                    // completes the input with the selected row (a folder row ends in \, so its entries show next)
+                    if let Some(r) = st(|s| s.results.get(s.sel).cloned()) {
+                        st(|s| (s.text, s.caret) = (r.encode_utf16().collect(), true));
+                        text_changed(h);
+                    }
+                }
                 _ => return 0,
             }
             start_anim(h);
@@ -667,7 +735,7 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_RBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
             match row_at(y) {
-                Some(i) if st(|s| s.rename.is_none() && s.purge.is_none()) => open_menu(h, i, x, y),
+                Some(i) if st(|s| s.rename.is_none() && s.purge.is_none() && !s.run) => open_menu(h, i, x, y),
                 _ => close_menu(h),
             }
             0
@@ -1062,7 +1130,7 @@ unsafe fn purge_press(h: HWND, i: usize) {
             });
             if let Some(b) = b {
                 hide(h);
-                ShellExecuteW(null_mut(), wide("open").as_ptr(), wide("explorer.exe").as_ptr(), wide(&format!("/select,\"{b}\"")).as_ptr(), null(), SW_SHOWNORMAL);
+                winrust_common::reveal(&b);
             }
         }
         Some(_) => close_purge(h),
@@ -1119,6 +1187,7 @@ struct View {
     menu: Option<(i32, i32, usize)>, // left, top, hot item
     menu_pinned: bool, // the menu's file is already in Start: item 3 reads "Remove from Start"
     purge: Option<PView>,
+    run: bool,
 }
 
 /// What the purge panel shows, snapshotted for one paint.
@@ -1256,8 +1325,8 @@ unsafe fn paint(h: HWND) {
         scale: s.scale,
         fonts: s.fonts,
         text: s.text.clone(),
-        rows: s.results.iter().skip(s.top).take(MAX_ROWS).map(|p| {
-            let (a, b) = labels(p);
+        rows: s.results.iter().enumerate().skip(s.top).take(MAX_ROWS).map(|(i, p)| {
+            let (a, b) = if s.run { run_labels(p, s.run_src.get(i).copied()) } else { labels(p) };
             (a, b, s.icons.get(p).copied().unwrap_or(0))
         }).collect(),
         total: s.results.len(),
@@ -1270,6 +1339,7 @@ unsafe fn paint(h: HWND) {
         }),
         menu_pinned: s.menu.as_ref().is_some_and(|m| start_pinned(&m.path)),
         purge: purge_view(s),
+        run: s.run,
     });
     let mut ps: PAINTSTRUCT = zeroed();
     let dc = BeginPaint(h, &mut ps);
@@ -1340,11 +1410,13 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
 
     // input row
     let mid = p(INPUT_H) / 2;
-    text(dc, v.fonts[F_ICON], c_dim(), RECT { left: p(22), top: mid - p(14), right: p(52), bottom: mid + p(14) }, "\u{E721}", DT_SINGLELINE | DT_VCENTER);
+    let (glyph, gc) = if v.run { ("\u{E756}", c_accent()) } else { ("\u{E721}", c_dim()) }; // Run mode: a prompt, not a magnifier
+    text(dc, v.fonts[F_ICON], gc, RECT { left: p(22), top: mid - p(14), right: p(52), bottom: mid + p(14) }, glyph, DT_SINGLELINE | DT_VCENTER);
     let area = RECT { left: p(58), top: mid - p(18), right: w - p(24), bottom: mid + p(18) };
     let shown = String::from_utf16_lossy(&v.text);
     if v.text.is_empty() {
-        text(dc, v.fonts[F_INPUT], c_faint(), area, "Search files and apps", DT_SINGLELINE | DT_VCENTER);
+        let hint = if v.run { winrust_common::t!("Программа, папка, документ или сайт", "Type a program, folder, document or website") } else { "Search files and apps" };
+        text(dc, v.fonts[F_INPUT], c_faint(), area, hint, DT_SINGLELINE | DT_VCENTER);
     } else {
         let mut size: SIZE = zeroed();
         let old = SelectObject(dc, v.fonts[F_INPUT] as _);
@@ -1363,7 +1435,7 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
         fill(dc, p(58), mid - p(13), p(58) + p(2), mid + p(13), c_accent());
     }
 
-    if !v.text.is_empty() || v.purge.is_some() {
+    if !v.text.is_empty() || v.purge.is_some() || nrows > 0 {
         fill(dc, p(PAD + 6), p(INPUT_H) - 1, w - p(PAD + 6), p(INPUT_H), c_border()); // separator
     }
     if let Some(pv) = &v.purge {
@@ -1393,7 +1465,9 @@ unsafe fn draw(dc: HDC, w: i32, hgt: i32, v: &View) {
         v.fonts[F_HINT],
         c_faint(),
         RECT { left: p(PAD + 16), top: foot_y + p(4), right: w - p(PAD + 14), bottom: foot_y + p(FOOT_H) },
-        &if v.renaming {
+        &if v.run {
+            winrust_common::t!("{21B5} выполнить     Ctrl+Shift+{21B5} от администратора     Tab дополнить     Esc закрыть", "{21B5} run     Ctrl+Shift+{21B5} as administrator     Tab complete     Esc close").to_string()
+        } else if v.renaming {
             "Type the new name     \u{21B5} rename     Esc cancel".to_string()
         } else {
             format!("\u{2191}\u{2193} select     \u{21B5} open     Ctrl+\u{21B5} folder     Right-click menu     Esc close{more}")

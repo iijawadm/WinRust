@@ -27,6 +27,8 @@ const RELOAD: i32 = 4;
 const SEARCH: i32 = 5;
 const VIEW: i32 = 6;
 const PLUS: i32 = 7;
+const CMD: i32 = 10; // + 0..5: cut, copy, paste, rename, delete (Windows 11 command buttons)
+const CMD_GLYPHS: [&str; 5] = ["\u{E8C6}", "\u{E8C8}", "\u{E77F}", "\u{E8AC}", "\u{E74D}"];
 const TAB: i32 = 100; // + index
 const CLOSE: i32 = 200; // + index
 const CRUMB: i32 = 400; // + index: a part of the path in the address pill
@@ -242,16 +244,27 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 let mut st = c.try_borrow_mut().ok()?;
                 let State { dir, rows, .. } = &mut *st;
                 let r = rows.get_mut(i)?;
-                if r.icon < 0 { r.icon = icon_of(&dir.join(&r.name), r.dir); }
-                Some((r.name.clone(), r.dir, r.time, r.size, r.icon))
+                if r.icon < 0 && !r.hdr { r.icon = icon_of(&dir.join(&r.name), r.dir); }
+                Some((r.name.clone(), r.dir, r.time, r.size, r.icon, r.hdr))
             });
-            let Some((name, is_dir, time, size, icon)) = row else { return CDRF_DODEFAULT as isize };
+            let Some((name, is_dir, time, size, icon, hdr)) = row else { return CDRF_DODEFAULT as isize };
             let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
             SendMessageW(list, LVM_GETITEMRECT, i, &mut r as *mut _ as isize);
             let row_r = rc(0, r.top, cr.right, r.bottom);
             let b = CreateSolidBrush(listbg());
             FillRect(dc, &row_r, b);
             DeleteObject(b);
+            if hdr {
+                // a date heading: only its name, in the accent colour, never highlighted
+                let x0 = r.left;
+                if FONTS.get().0 == 0 { FONTS.set((font(14, 400, ui_face()), font(13, 400, ui_face()))); }
+                SetBkMode(dc, TRANSPARENT as i32);
+                let of = SelectObject(dc, FONTS.get().0 as HFONT);
+                text(dc, &name[1..], rc(x0 + sc(16), r.top + sc(8), cr.right, r.bottom), pal().accent, DT_LEFT);
+                fill(dc, rc(sc(16), r.bottom - 1, cr.right - sc(16), r.bottom), pal().line, 0);
+                SelectObject(dc, of);
+                return CDRF_SKIPDEFAULT as isize;
+            }
             let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
             let hot = ROWHOT.get() == i as isize;
             let focus = GetFocus() == list;
@@ -374,7 +387,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 // ---------- layout and hit testing ----------
 
-struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, view: RECT }
+struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, view: RECT, cmds: Vec<RECT> }
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
@@ -390,8 +403,10 @@ fn layout(cw: i32, n: usize) -> Layout {
     let view = rc(cw - sc(12) - bs, by0, cw - sc(12), by1);
     let search = rc(view.left - sc(4) - bs, by0, view.left - sc(4), by1);
     let reload = btn(3);
-    let pill = rc(reload.right + sc(8), by0, search.left - sc(8), by1);
-    Layout { tabs, close, plus, back: btn(0), fwd: btn(1), up: btn(2), reload, pill, search, view }
+    // command buttons only while the address pill keeps a usable width
+    let cmds: Vec<RECT> = if cw >= sc(900) { (4..9).map(btn).collect() } else { vec![] };
+    let pill = rc(cmds.last().unwrap_or(&reload).right + sc(8), by0, search.left - sc(8), by1);
+    Layout { tabs, close, plus, back: btn(0), fwd: btn(1), up: btn(2), reload, pill, search, view, cmds }
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
@@ -402,6 +417,7 @@ fn hit(l: &Layout, x: i32, y: i32) -> i32 {
     for (k, r) in [(BACK, &l.back), (FWD, &l.fwd), (UP, &l.up), (RELOAD, &l.reload), (SEARCH, &l.search), (VIEW, &l.view), (PLUS, &l.plus)] {
         if inside(r, x, y) { return k; }
     }
+    for (i, r) in l.cmds.iter().enumerate() { if inside(r, x, y) { return CMD + i as i32; } }
     NONE
 }
 
@@ -494,6 +510,7 @@ unsafe fn paint_chrome(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
+    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let l = layout(cr.right, labels.len());
     let hot = HOT.get();
@@ -525,6 +542,11 @@ unsafe fn paint_chrome(hwnd: HWND) {
     for (k, r, g, enabled) in [(BACK, l.back, "\u{E72B}", can_back), (FWD, l.fwd, "\u{E72A}", can_fwd), (UP, l.up, "\u{E74A}", true), (RELOAD, l.reload, "\u{E72C}", true), (SEARCH, l.search, "\u{E721}", true), (VIEW, l.view, if thumbs { "\u{E8FD}" } else { "\u{E80A}" }, true)] {
         if enabled { glow(dc, k, r, pal().bg, pal().hover, sc(8), hot == k); }
         text(dc, g, r, if enabled { pal().text } else { off() }, DT_CENTER);
+    }
+
+    for (i, r) in l.cmds.iter().enumerate() {
+        glow(dc, CMD + i as i32, *r, pal().bg, pal().hover, sc(8), hot == CMD + i as i32);
+        text(dc, CMD_GLYPHS[i], *r, pal().text, DT_CENTER);
     }
 
     // address pill: accent outline while it is being edited
@@ -595,6 +617,7 @@ pub unsafe fn paint_status(h: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &strip, bg);
     DeleteObject(bg);
+    winrust_common::style::backdrop(dc, strip, sc(100) as f32 / 100.0);
     fill(dc, rc(0, strip.top, cr.right, strip.top + 1), pal().line, 0); // hairline above the status line
     let snap = ST.with(|c| {
         c.try_borrow().ok().map(|s| {
@@ -603,10 +626,11 @@ pub unsafe fn paint_status(h: HWND) {
             loop {
                 i = SendMessageW(s.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
                 let Some(r) = usize::try_from(i).ok().and_then(|i| s.rows.get(i)) else { break };
+                if r.hdr { continue; }
                 n += 1;
                 if !r.dir { bytes += r.size; }
             }
-            (s.rows.len(), n, bytes)
+            (s.rows.iter().filter(|r| !r.hdr).count(), n, bytes)
         })
     });
     if let Some((n, sel, bytes)) = snap {
@@ -680,7 +704,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             PRESS.set((k, now()));
             InvalidateRect(h, ptr::null(), 0);
             let (act, idx) = match k {
-                BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), SEARCH => (9, 0), VIEW => (8, 0), PLUS => (3, 0),
+                k if (CMD..CMD + 5).contains(&k) => (k as usize - CMD as usize + 10, 0), BACK => (4, 0), FWD => (5, 0), UP => (6, 0), RELOAD => (7, 0), SEARCH => (9, 0), VIEW => (8, 0), PLUS => (3, 0),
                 k if k >= CLOSE => (2, (k - CLOSE) as isize),
                 k => (if m == WM_MBUTTONDOWN { 2 } else { 1 }, (k - TAB) as isize), // middle click on a tab closes it
             };
@@ -842,6 +866,7 @@ unsafe fn paint_nav(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
+    winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
     SetBkMode(dc, TRANSPARENT as i32);
     let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
     let of = SelectObject(dc, f_txt);

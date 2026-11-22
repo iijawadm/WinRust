@@ -114,6 +114,32 @@ pub fn set_autohide(on: bool) {
     }
 }
 
+fn left_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("align-left.txt"))
+}
+
+static LEFT: AtomicU8 = AtomicU8::new(0);
+static LEFT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Start and the pinned apps sit at the bar's left end, like Windows 10 (off unless the file says 1). Re-read once a second.
+pub fn align_left() -> bool {
+    if now_ms().saturating_sub(LEFT_AT.load(Relaxed)) > 1000 {
+        LEFT.store(left_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1") as u8, Relaxed);
+        LEFT_AT.store(now_ms(), Relaxed);
+    }
+    LEFT.load(Relaxed) == 1
+}
+
+pub fn set_align_left(on: bool) {
+    LEFT.store(on as u8, Relaxed);
+    LEFT_AT.store(now_ms(), Relaxed);
+    if let Some(f) = left_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, if on { "1" } else { "0" });
+    }
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
 /// Which screen edge the topbar sits on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -177,22 +203,12 @@ pub fn set_side(s: Side) {
     }
 }
 
-fn align_file() -> Option<PathBuf> {
-    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("align.txt"))
-}
-
 fn desk_icons_file() -> Option<PathBuf> {
     std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("desktop-icons.txt"))
 }
 
-static ALIGN: AtomicU8 = AtomicU8::new(0);
-static ALIGN_AT: AtomicU64 = AtomicU64::new(0);
 static DESK_HIDE_ICONS: AtomicU8 = AtomicU8::new(0);
 static DESK_HIDE_AT: AtomicU64 = AtomicU64::new(0);
-
-fn parse_left_align(s: &str) -> bool {
-    matches!(s.trim().to_ascii_lowercase().as_str(), "left" | "1" | "true")
-}
 
 fn parse_flag(s: &str) -> bool {
     matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "hide" | "hidden")
@@ -200,32 +216,21 @@ fn parse_flag(s: &str) -> bool {
 
 fn reload_prefs() {
     let now = now_ms();
-    let la = align_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_left_align(&s));
-    ALIGN.store(la as u8, Relaxed);
-    ALIGN_AT.store(now, Relaxed);
+    let la = left_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1");
+    LEFT.store(la as u8, Relaxed);
+    LEFT_AT.store(now, Relaxed);
     let dh = desk_icons_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_flag(&s));
     DESK_HIDE_ICONS.store(dh as u8, Relaxed);
     DESK_HIDE_AT.store(now, Relaxed);
 }
 
-/// Align the taskbar's Start button and app icons to the left (false = centered, the default). Re-read once a second.
+/// Alias for `align_left()` kept for internal callers.
 pub fn left_align() -> bool {
-    if now_ms().saturating_sub(ALIGN_AT.load(Relaxed)) > 1000 {
-        let la = align_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_left_align(&s));
-        ALIGN.store(la as u8, Relaxed);
-        ALIGN_AT.store(now_ms(), Relaxed);
-    }
-    ALIGN.load(Relaxed) == 1
+    align_left()
 }
 
 pub fn set_left_align(left: bool) {
-    ALIGN.store(left as u8, Relaxed);
-    ALIGN_AT.store(now_ms(), Relaxed);
-    if let Some(f) = align_file() {
-        let _ = std::fs::create_dir_all(f.parent().unwrap());
-        let _ = std::fs::write(f, if left { "left" } else { "center" });
-    }
-    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+    set_align_left(left);
 }
 
 /// Hide desktop icons (false = visible, the default). Re-read once a second and updated immediately via `msg()`.
@@ -263,6 +268,7 @@ pub fn msg() -> u32 {
 }
 
 /// Colours of one style, as COLORREF (0x00BBGGRR) like GDI wants them.
+#[derive(Clone, Copy)]
 pub struct Pal {
     pub bg: u32,
     pub line: u32,
@@ -299,7 +305,187 @@ pub const WARN: u32 = rgb(255, 214, 10);
 pub const BAD: u32 = rgb(255, 69, 58);
 
 pub fn pal() -> &'static Pal {
-    &PALS[ALL.iter().position(|&s| s == style()).unwrap_or(0)]
+    let base = &PALS[ALL.iter().position(|&s| s == style()).unwrap_or(0)];
+    let Some(o) = custom_colors() else { return base };
+    // one leaked copy per (style, overrides): a handful at most, and pal() has to hand out a reference
+    static CACHE: std::sync::Mutex<Vec<(usize, [u32; 7], &'static Pal)>> = std::sync::Mutex::new(Vec::new());
+    let key = base as *const Pal as usize;
+    let mut v = CACHE.lock().unwrap();
+    if let Some(e) = v.iter().find(|e| e.0 == key && e.1 == o) {
+        return e.2;
+    }
+    let p: &'static Pal = Box::leak(Box::new(custom_pal(base, o)));
+    v.push((key, o, p));
+    p
+}
+
+/// The style's palette with the user's colours on top. Lines, hover and pressed colours that were not set follow the
+/// background and text colours, so changing just the background still gives a consistent bar.
+fn custom_pal(base: &Pal, o: [u32; 7]) -> Pal {
+    let get = |i: usize, d: u32| if o[i] == u32::MAX { d } else { o[i] };
+    let bg = get(0, base.bg);
+    let text = get(5, base.text);
+    let derive = o[0] != u32::MAX || o[5] != u32::MAX;
+    Pal {
+        bg,
+        line: get(1, if derive { mix(bg, text, 0.12) } else { base.line }),
+        hover: get(2, if derive { mix(bg, text, 0.07) } else { base.hover }),
+        active: get(3, if derive { mix(bg, text, 0.12) } else { base.active }),
+        accent: get(4, base.accent),
+        text,
+        dim: get(6, if derive { mix(bg, text, 0.55) } else { base.dim }),
+    }
+}
+
+/// Names of the colours the user can set, in the order of `Pal`'s fields (bg, line, hover, active, accent, text, dim).
+pub const COLOR_NAMES: [&str; 7] = ["bg", "line", "hover", "active", "accent", "text", "dim"];
+
+fn colors_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("colors.txt"))
+}
+
+static COLORS: std::sync::Mutex<[u32; 7]> = std::sync::Mutex::new([u32::MAX; 7]); // COLORREF, u32::MAX = the style's own
+static COLORS_AT: AtomicU64 = AtomicU64::new(0);
+
+fn read_colors() -> [u32; 7] {
+    parse_colors(&colors_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default())
+}
+
+/// `bg=RRGGBB` pairs, one per line or separated by `;` (colors.txt and the templates); unknown names and junk are skipped.
+fn parse_colors(text: &str) -> [u32; 7] {
+    let mut o = [u32::MAX; 7];
+    for l in text.split(['\n', ';']) {
+        if let Some((k, v)) = l.split_once('=') {
+            if let (Some(i), Ok(v)) = (COLOR_NAMES.iter().position(|n| *n == k.trim()), u32::from_str_radix(v.trim(), 16)) {
+                if v <= 0xFFFFFF { o[i] = rgb((v >> 16) as u8, (v >> 8) as u8, v as u8); }
+            }
+        }
+    }
+    o
+}
+
+fn colors_text(c: &[u32; 7], sep: &str) -> String {
+    c.iter().enumerate().filter(|(_, v)| **v != u32::MAX).map(|(i, v)| format!("{}={:02X}{:02X}{:02X}{sep}", COLOR_NAMES[i], v & 255, (v >> 8) & 255, (v >> 16) & 255)).collect()
+}
+
+/// The user's colours (one per `COLOR_NAMES`, u32::MAX = not set), None when none is set. Re-read once a second.
+pub fn custom_colors() -> Option<[u32; 7]> {
+    let mut c = COLORS.lock().unwrap();
+    if now_ms().saturating_sub(COLORS_AT.load(Relaxed)) > 1000 {
+        *c = read_colors();
+        COLORS_AT.store(now_ms(), Relaxed);
+    }
+    c.iter().any(|v| *v != u32::MAX).then_some(*c)
+}
+
+/// Sets colour `i` (COLORREF; None = back to the style's own) and tells the other WinRust windows to repaint.
+pub fn set_custom_color(i: usize, c: Option<u32>) {
+    let mut cur = read_colors();
+    cur[i] = c.unwrap_or(u32::MAX);
+    save_colors(cur);
+}
+
+/// Back to the style's own colours and opacity.
+pub fn reset_custom() {
+    save_colors([u32::MAX; 7]);
+    set_bar_opacity(100);
+}
+
+fn save_colors(c: [u32; 7]) {
+    let text = colors_text(&c, "\n");
+    if let Some(f) = colors_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = if text.is_empty() { std::fs::remove_file(f) } else { std::fs::write(f, text) };
+    }
+    *COLORS.lock().unwrap() = c;
+    COLORS_AT.store(now_ms(), Relaxed);
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
+fn opacity_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("bar-opacity.txt"))
+}
+
+static OPACITY: AtomicU8 = AtomicU8::new(100);
+static OPACITY_AT: AtomicU64 = AtomicU64::new(0);
+
+/// How opaque the topbar is, percent (30..=100). Re-read once a second.
+pub fn bar_opacity() -> u8 {
+    if now_ms().saturating_sub(OPACITY_AT.load(Relaxed)) > 1000 {
+        let v = opacity_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).map_or(100, |v| v.clamp(30, 100));
+        OPACITY.store(v, Relaxed);
+        OPACITY_AT.store(now_ms(), Relaxed);
+    }
+    OPACITY.load(Relaxed)
+}
+
+pub fn set_bar_opacity(v: u8) {
+    let v = v.clamp(30, 100);
+    OPACITY.store(v, Relaxed);
+    OPACITY_AT.store(now_ms(), Relaxed);
+    if let Some(f) = opacity_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, v.to_string());
+    }
+}
+
+/// A saved look (a "template"): the style, the user's colours and the bar's opacity. One per line of
+/// %ProgramData%\WinRust\themes.txt: `name<TAB>style<TAB>opacity<TAB>bg=RRGGBB;text=RRGGBB;`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Theme {
+    pub name: String,
+    pub style: Style,
+    pub colors: [u32; 7],
+    pub opacity: u8,
+}
+
+impl Theme {
+    fn line(&self) -> String {
+        format!("{}\t{}\t{}\t{}", self.name.replace(['\t', '\r', '\n'], " "), self.style.name(), self.opacity, colors_text(&self.colors, ";"))
+    }
+    fn parse(l: &str) -> Option<Theme> {
+        let mut f = l.trim_end_matches('\r').splitn(4, '\t');
+        let name = f.next().filter(|n| !n.trim().is_empty())?.to_string();
+        let style = Style::parse(f.next()?);
+        let opacity = f.next()?.trim().parse::<u8>().ok()?.clamp(30, 100);
+        Some(Theme { name, style, colors: parse_colors(f.next().unwrap_or("")), opacity })
+    }
+    /// What is on screen now.
+    pub fn current(name: &str) -> Theme {
+        Theme { name: name.into(), style: style(), colors: read_colors(), opacity: bar_opacity() }
+    }
+    /// Switches every WinRust window to this look.
+    pub fn apply(&self) {
+        set_bar_opacity(self.opacity);
+        save_colors(self.colors);
+        set_style(self.style);
+    }
+}
+
+fn themes_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("themes.txt"))
+}
+
+/// The saved templates, oldest first.
+pub fn themes() -> Vec<Theme> {
+    themes_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default().lines().filter_map(Theme::parse).collect()
+}
+
+pub fn save_themes(t: &[Theme]) {
+    if let Some(f) = themes_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, t.iter().map(|t| t.line() + "\n").collect::<String>());
+    }
+}
+
+/// Everything the gear menu sets, back to how a fresh install looks (the saved templates stay).
+pub fn reset_all() {
+    set_side(Side::Bottom);
+    set_bar_size(1);
+    set_autohide(false);
+    set_align_left(false);
+    set_alttab_per_monitor(false);
+    Theme { name: String::new(), style: Style::Normal, colors: [u32::MAX; 7], opacity: 100 }.apply();
 }
 
 /// A raised surface (a card, a tile): pure white on the light style, a step up from the background on the dark ones.
@@ -443,6 +629,22 @@ mod tests {
     }
 
     #[test]
+    fn theme_line_round_trips() {
+        let mut c = [u32::MAX; 7];
+        c[0] = rgb(1, 2, 3);
+        c[4] = rgb(250, 128, 0);
+        let t = Theme { name: "Ночь\tтест".into(), style: Style::Ruby, colors: c, opacity: 70 };
+        let back = Theme::parse(&t.line()).unwrap();
+        assert_eq!(back.name, "Ночь тест");
+        assert_eq!((back.style, back.colors, back.opacity), (Style::Ruby, c, 70));
+        assert_eq!(Theme::parse("a\tnormal\t5\t").unwrap().opacity, 30);
+        assert!(Theme::parse("").is_none() && Theme::parse("x\tnormal").is_none());
+        let mut one = [u32::MAX; 7];
+        one[0] = rgb(1, 2, 3);
+        assert_eq!(parse_colors("bg=010203\nzz=1;text=GG"), one);
+    }
+
+    #[test]
     fn side_parses_and_defaults_to_bottom() {
         assert_eq!(Side::parse(" Left\n"), Side::Left);
         assert_eq!(Side::parse("right"), Side::Right);
@@ -451,14 +653,61 @@ mod tests {
     }
 
     #[test]
-    fn align_and_desktop_icon_flags_parse() {
-        assert!(parse_left_align("left"));
-        assert!(parse_left_align(" LEFT\r\n"));
-        assert!(!parse_left_align("center"));
-        assert!(!parse_left_align(""));
+    fn desktop_icon_flags_parse() {
         assert!(parse_flag("1"));
         assert!(parse_flag("hide"));
         assert!(!parse_flag("0"));
         assert!(!parse_flag(""));
+    }
+}
+
+fn size_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("bar-size.txt"))
+}
+
+static SIZE: AtomicU8 = AtomicU8::new(1);
+static SIZE_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Height class of the topbar: 0 small, 1 normal (default), 2 large. Re-read once a second.
+pub fn bar_size() -> u8 {
+    if now_ms().saturating_sub(SIZE_AT.load(Relaxed)) > 1000 {
+        let v = size_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| s.trim().parse::<u8>().ok()).filter(|v| *v <= 2).unwrap_or(1);
+        SIZE.store(v, Relaxed);
+        SIZE_AT.store(now_ms(), Relaxed);
+    }
+    SIZE.load(Relaxed)
+}
+
+pub fn set_bar_size(v: u8) {
+    SIZE.store(v.min(2), Relaxed);
+    SIZE_AT.store(now_ms(), Relaxed);
+    if let Some(f) = size_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, v.min(2).to_string());
+    }
+}
+
+fn mon_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("alttab-monitor.txt"))
+}
+
+static MON: AtomicU8 = AtomicU8::new(0);
+static MON_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Alt+Tab lists only the windows of the monitor the active window is on (off unless the file says 1). Re-read once a second.
+pub fn alttab_per_monitor() -> bool {
+    if now_ms().saturating_sub(MON_AT.load(Relaxed)) > 1000 {
+        MON.store(mon_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1") as u8, Relaxed);
+        MON_AT.store(now_ms(), Relaxed);
+    }
+    MON.load(Relaxed) == 1
+}
+
+pub fn set_alttab_per_monitor(on: bool) {
+    MON.store(on as u8, Relaxed);
+    MON_AT.store(now_ms(), Relaxed);
+    if let Some(f) = mon_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, if on { "1" } else { "0" });
     }
 }

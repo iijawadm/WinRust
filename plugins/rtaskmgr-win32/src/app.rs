@@ -1078,10 +1078,7 @@ impl App {
                 let path = pids.iter().find_map(|&p| d.procs.iter().find(|x| x.pid == p).and_then(|x| x.exe.clone()));
                 drop(d);
                 match path {
-                    Some(p) => {
-                        use std::os::windows::process::CommandExt;
-                        let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.replace("\\..\\", "\\"))).spawn();
-                    }
+                    Some(p) => winrust_common::reveal(&p.replace("\\..\\", "\\")),
                     None => self.toast(t!("Путь к файлу недоступен (системный или защищённый процесс)", "File path unavailable (system or protected process)")),
                 }
             }
@@ -1138,10 +1135,7 @@ impl App {
             Act::StartEnable => true,
             Act::StartDisable => false,
             Act::OpenDir => {
-                if let Some(p) = &row.icon_path {
-                    use std::os::windows::process::CommandExt;
-                    let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{p}\"")).spawn();
-                }
+                if let Some(p) = &row.icon_path { winrust_common::reveal(p); }
                 return;
             }
             _ => return,

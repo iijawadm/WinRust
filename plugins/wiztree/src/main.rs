@@ -269,7 +269,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 });
                 if let Some(p) = act {
                     // show the file in Explorer (delete it from there)
-                    ShellExecuteW(null_mut(), wide("open").as_ptr(), wide("explorer.exe").as_ptr(), wide(&format!("/select,\"{p}\"")).as_ptr(), null(), SW_SHOWNORMAL);
+                    winrust_common::reveal(&p);
                 }
                 InvalidateRect(hwnd, null(), 0);
                 0

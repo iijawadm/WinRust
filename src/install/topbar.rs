@@ -56,7 +56,11 @@ pub(crate) fn bar_install() -> Result<(), String> {
         let rsh = bar_dir().join("reshell.exe"); // Win+1/2/3 desktop hotkeys, no args = hotkeys
         let _ = run("taskkill", &["/f", "/im", "reshell.exe"]);
         put(&d.join("reshell.exe"), &rsh)?;
-        run("reg", &["add", RUN_KEY, "/v", "reshell", "/t", "REG_SZ", "/d", &format!("\"{}\"", rsh.display()), "/f"])?;
+        if logon_task("reshell", &rsh) {
+            let _ = run("reg", &["delete", RUN_KEY, "/v", "reshell", "/f"]);
+        } else {
+            run("reg", &["add", RUN_KEY, "/v", "reshell", "/t", "REG_SZ", "/d", &format!("\"{}\"", rsh.display()), "/f"])?; // fallback
+        }
         let _ = Command::new("explorer.exe").arg(&rsh).spawn();
         run(dst.to_str().unwrap(), &["--restore"])?; // clean state in case a killed instance left the taskbar hidden
         // The bar runs elevated (a task with the highest run level starts it at logon without a UAC prompt): that lets it close
@@ -79,6 +83,7 @@ pub(crate) fn bar_uninstall() -> Result<(), String> {
     let _ = run("reg", &["delete", RUN_KEY, "/v", "topbar", "/f"]);
     let _ = run("schtasks", &["/delete", "/tn", "topbar", "/f"]);
     let _ = run("reg", &["delete", RUN_KEY, "/v", "reshell", "/f"]);
+    let _ = run("schtasks", &["/delete", "/tn", "reshell", "/f"]);
     let _ = run("taskkill", &["/f", "/im", "reshell.exe"]);
     let _ = run("taskkill", &["/f", "/im", "topbar.exe"]);
     let _ = profile_uninstall();

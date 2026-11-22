@@ -13,9 +13,20 @@ pub mod gaming;
 pub mod journal;
 pub mod mem;
 pub mod mft;
+pub mod proc;
 pub mod reg;
 pub mod settings;
 pub mod style;
+
+/// "Show in folder": opens `path`'s folder with the file selected in the installed rust-explorer, else in Windows Explorer.
+pub fn reveal(path: &str) {
+    use std::{os::windows::process::CommandExt, process::Command};
+    let rx = std::env::var_os("ProgramFiles").map(|pf| PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe")).filter(|p| p.is_file());
+    let _ = match rx {
+        Some(rx) => Command::new(rx).raw_arg(format!("/select,\"{path}\"")).spawn(),
+        None => Command::new("explorer.exe").raw_arg(format!("/select,\"{path}\"")).spawn(),
+    };
+}
 
 static LANG: AtomicU8 = AtomicU8::new(0); // 0 = not read yet, 1 = English, 2 = Russian
 

@@ -173,7 +173,7 @@ pub fn load_apps() {
 }
 
 /// (display name, app id) of everything in the shell's Apps folder (what the Windows Start menu lists).
-fn apps_folder() -> Vec<(String, String)> {
+pub fn apps_folder() -> Vec<(String, String)> {
     use windows::Win32::{
         System::Com::CoTaskMemFree,
         UI::Shell::{BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING},
@@ -776,7 +776,10 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             v.extend(ctx_rects()); // last: on top of the rows
             v
         }
-        Kind::Menu => menu_rows().0.into_iter().enumerate().map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect(),
+        Kind::Menu => {
+            let heads: Vec<bool> = MITEMS.with_borrow(|m| m.iter().map(|it| it.head).collect());
+            menu_rows().0.into_iter().enumerate().filter(|(i, _)| !heads[*i]).map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect()
+        }
         Kind::Start => {
             let f = filtered();
             let s = SCROLL.get();
@@ -812,11 +815,20 @@ pub struct MItem {
     pub on: bool,
     pub danger: bool,
     pub sep: bool,
+    pub head: bool,  // a section caption: small dim text, not clickable
+    pub swatch: u32, // a colour dot before the label (COLORREF), u32::MAX = none
 }
 
 impl MItem {
+    pub fn head(label: impl Into<String>) -> Self {
+        MItem { head: true, ..MItem::new(label) }
+    }
+    pub fn swatch(mut self, c: u32) -> Self {
+        self.swatch = c;
+        self
+    }
     pub fn new(label: impl Into<String>) -> Self {
-        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false }
+        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false, head: false, swatch: u32::MAX }
     }
     pub fn hint(mut self, h: &'static str) -> Self {
         self.hint = h;
@@ -869,8 +881,9 @@ fn menu_rows() -> (Vec<(i32, i32)>, i32) {
                 if it.sep {
                     y += 9;
                 }
-                y += MROW;
-                (y - MROW, y)
+                let h = if it.head { 28 } else { MROW };
+                y += h;
+                (y - h, y)
             })
             .collect()
     });
@@ -1095,7 +1108,7 @@ unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
         }
         3 => {
             let p = String::from_utf16_lossy(&lnk[..lnk.len().saturating_sub(1)]);
-            ShellExecuteW(null_mut(), wide("open").as_ptr(), wide("explorer.exe").as_ptr(), wide(&format!("/select,\"{p}\"")).as_ptr(), null(), SW_SHOWNORMAL);
+            winrust_common::reveal(&p);
         }
         4 => {
             start_toggle(&path);
@@ -1730,7 +1743,19 @@ unsafe fn paint(hw: HWND, k: Kind) {
             });
             let rs = rects(k);
             MITEMS.with_borrow(|items| {
-                for ((rc, a), it) in rs.iter().zip(items) {
+                // section captions have no rect of their own (not clickable): drawn straight from the row layout
+                SelectObject(dc, f_small);
+                for (it, (t, b)) in items.iter().zip(menu_rows().0) {
+                    if it.head {
+                        if it.sep {
+                            fill(dc, r(12, t - 5, w - 12, t - 4), pal().line, 0);
+                        }
+                        text(dc, &it.label, r(20, t + 8, w - 14, b), pal().dim, DT_LEFT);
+                    }
+                }
+                for (rc, a) in rs.iter() {
+                    let Act::Menu(i) = *a else { continue };
+                    let it = &items[i as usize];
                     if it.sep {
                         fill(dc, RECT { left: rc.left + sc(6), top: rc.top - sc(5), right: rc.right - sc(6), bottom: rc.top - sc(5) + 1 }, pal().line, 0);
                     }
@@ -1741,6 +1766,12 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     if !it.icon.is_null() {
                         DrawIconEx(dc, lx, (rc.top + rc.bottom) / 2 - sc(8), it.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
                         lx += sc(26);
+                    }
+                    if it.swatch != u32::MAX {
+                        let (cy, d) = ((rc.top + rc.bottom) / 2, sc(9));
+                        fill(dc, RECT { left: lx, top: cy - d, right: lx + 2 * d, bottom: cy + d }, pal().line, 2 * d); // ring: the dot shows on any background
+                        fill(dc, RECT { left: lx + 1, top: cy - d + 1, right: lx + 2 * d - 1, bottom: cy + d - 1 }, it.swatch, 2 * d);
+                        lx += sc(28);
                     }
                     let mut rx = rc.right - sc(14);
                     if it.on {
@@ -1753,7 +1784,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         text(dc, it.hint, RECT { left: lx, right: rx, ..*rc }, mix(pal().dim, pal().bg, 0.25), DT_RIGHT);
                     }
                     SelectObject(dc, f_txt);
-                    text(dc, &it.label, RECT { left: lx, right: rx - if it.hint.is_empty() { 0 } else { sc(96) }, ..*rc }, if it.on { pal().accent } else { col }, DT_LEFT);
+                    text(dc, &it.label, RECT { left: lx, right: rx - match it.hint.chars().count() { 0 => 0, 1..=2 => sc(20), _ => sc(96) }, ..*rc }, if it.on { pal().accent } else { col }, DT_LEFT);
                 }
             });
         }

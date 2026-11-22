@@ -68,6 +68,12 @@ pub(crate) fn task_user() -> String {
 
 /// PowerShell: `$p` = this shell's CurrentUserCurrentHost profile of the target user (Documents may be redirected: the
 /// User Shell Folders value of that user's hive says where).
+/// Logon task (Limited) for the signed-in user: unlike a HKCU Run value it cannot land in an MSIX package's private registry copy.
+pub(crate) fn logon_task(name: &str, exe: &Path) -> bool {
+    let task = format!("{} Register-ScheduledTask -TaskName {name} -Force -Action (New-ScheduledTaskAction -Execute '{}') -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $u) -Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited) -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)) | Out-Null", task_user(), exe.display());
+    run("powershell", &["-NoProfile", "-Command", &task]).is_ok()
+}
+
 pub(crate) fn profile_path() -> String {
     match env::var(i18n::reg::SID_ENV).ok().filter(|s| i18n::reg::valid_sid(s)) {
         Some(sid) => format!(

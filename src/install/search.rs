@@ -42,7 +42,11 @@ pub(crate) fn install() -> Result<(), String> {
         let dst = prog_dir().join("rs-launcher.exe"); // must live somewhere stable: --autostart registers its own path
         let _ = run("taskkill", &["/f", "/im", "rs-launcher.exe"]);
         put(&src.join("rs-launcher.exe"), &dst)?;
-        run(dst.to_str().unwrap(), &["--autostart"])?;
+        if logon_task("rs-launcher", &dst) {
+            let _ = run("reg", &["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "rs-launcher", "/f"]);
+        } else {
+            run(dst.to_str().unwrap(), &["--autostart"])?; // fallback: Run key
+        }
         // via explorer: it starts the launcher with the desktop user's normal token. Started from here it would
         // inherit admin rights, and every file opened from search would run elevated too.
         let _ = Command::new("explorer.exe").arg(&dst).spawn();
@@ -64,6 +68,7 @@ pub(crate) fn uninstall() -> Result<(), String> {
     journal()?.undo()?;
     let _ = run("taskkill", &["/f", "/im", "rs-launcher.exe"]);
     let _ = run("reg", &["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "rs-launcher", "/f"]);
+    let _ = run("schtasks", &["/delete", "/tn", "rs-launcher", "/f"]);
     let k = svc_key("WSearch");
     if svc_mode(reg_dword(&k, "Start"), reg_dword(&k, "DelayedAutostart")).is_some_and(|m| m.ends_with("auto")) {
         let _ = run("sc.exe", &["start", "WSearch"]);

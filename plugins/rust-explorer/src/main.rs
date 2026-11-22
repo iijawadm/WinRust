@@ -20,13 +20,58 @@
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{BLACK_BRUSH, GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
 
+mod zipx; // our own ZIP engine (deflate, inflate, container)
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
+mod shellwin; // registers the window as a shell window: "Show in folder" from other apps selects the file
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 fn desk() -> bool { DESKTOP.load(Relaxed) }
 const CLR_NONE: isize = 0xFFFF_FFFF; // list background / text background: let the parent's wallpaper show through
 thread_local! { static WALL: std::cell::Cell<(isize, i32, i32)> = const { std::cell::Cell::new((0, 0, 0)) }; } // (HBITMAP, w, h)
+/// The virtual screen (every monitor): x, y, width, height. The desktop window covers it so each monitor gets its wallpaper.
+fn virt() -> (i32, i32, i32, i32) {
+    unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) }
+}
+/// The desktop's icon list stays on the primary monitor (at screen 0,0, i.e. -vx, -vy inside the desktop window), between the bar's strips.
+fn place_desk_list(list: HWND) {
+    let (vx, vy, ..) = virt();
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    unsafe { MoveWindow(list, -vx, -vy + desk_top(), sw, (sh - desk_top() - desk_bottom()).max(0), 1) };
+}
+/// Renders the wallpaper for the current monitor layout (at start and when monitors change), freeing the old one.
+fn reload_wall() {
+    let (vx, vy, cw, ch) = virt();
+    let old = WALL.replace((wall::load(vx, vy, cw, ch), cw, ch)).0;
+    if old != 0 { unsafe { windows_sys::Win32::Graphics::Gdi::DeleteObject(old as _) }; }
+}
+/// Where the file manager window was when it last closed: %APPDATA%\rust-explorer\window.txt, `max|normal left top right bottom`
+/// (the restored rectangle, so un-maximizing goes back to the size it had).
+fn place_file() -> PathBuf {
+    PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\window.txt")
+}
+fn parse_place(s: &str) -> Option<(bool, RECT)> {
+    let mut it = s.split_whitespace();
+    let max = match it.next()? { "max" => true, "normal" => false, _ => return None };
+    let n: Vec<i32> = it.map(str::parse).collect::<Result<_, _>>().ok()?;
+    let [left, top, right, bottom] = n[..] else { return None };
+    (right - left >= 200 && bottom - top >= 150).then_some((max, RECT { left, top, right, bottom })) // junk or a collapsed window: default size
+}
+fn save_place(h: HWND) {
+    let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+    if unsafe { GetWindowPlacement(h, &mut wp) } == 0 { return; }
+    let r = wp.rcNormalPosition;
+    let f = place_file();
+    let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
+    let _ = fs::write(f, format!("{} {} {} {} {}", if wp.showCmd == SW_SHOWMAXIMIZED as u32 { "max" } else { "normal" }, r.left, r.top, r.right, r.bottom));
+}
+/// The saved place, if it is still on a monitor (one may have been unplugged since).
+fn saved_place() -> Option<(bool, RECT)> {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    let (max, r) = parse_place(&fs::read_to_string(place_file()).ok()?)?;
+    (!unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_null()).then_some((max, r))
+}
 /// What the bar reserves at the top and bottom of the screen: the work area topbar sets when there is no explorer.
 fn work_strips() -> (i32, i32) {
     let mut r: RECT = unsafe { std::mem::zeroed() };
@@ -48,8 +93,9 @@ static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> = std::sync::OnceLock::new();
 const WM_GO: u32 = WM_APP + 1; // address bar: Enter (wp 13) / Esc (wp 27)
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static LABEL_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0); // the rename box (only one exists at a time)
 
-struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32 } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
+struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
 
 /// Back / forward trail of visited folders (one for the whole window, not per tab).
 #[derive(Default)]
@@ -77,7 +123,7 @@ const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (se
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
-    Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2 }
+    Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2, hdr: false }
 }
 
 /// Folders always first; inside each group by the column (0 name, 1 size, 2 modified), ties by name.
@@ -87,6 +133,62 @@ fn sort_rows(rows: &mut [Row], col: usize, asc: bool) {
         let o = match col { 1 => a.time.cmp(&b.time), 2 => type_text(&a.name, a.dir).cmp(&type_text(&b.name, b.dir)), 3 => a.size.cmp(&b.size), _ => key(a).cmp(&key(b)) };
         (!a.dir).cmp(&!b.dir).then(if asc { o } else { o.reverse() }).then_with(|| key(a).cmp(&key(b)))
     });
+    // grouped by date: the groups are contiguous (the stable sort keeps the order above inside each one)
+    if group_on() { bucket_refresh(); rows.sort_by_cached_key(|r| bucket(r.time)); }
+}
+
+// ---------- grouping by date ("Group by date" in the folder's menu): Today, Yesterday, Earlier this week, ... ----------
+
+const DAY: i64 = 864_000_000_000; // FILETIME ticks per day
+const BUCKETS: [&str; 8] = ["Today", "Yesterday", "Earlier this week", "Last week", "Earlier this month", "Last month", "Earlier this year", "A long time ago"];
+
+thread_local! {
+    static BCTX: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((0, 0)) }; // (today's local day number, local - UTC in ticks)
+}
+
+fn group_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\group-by-date") }
+static THUMBS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); // thumbnail view: no headings
+fn group_on() -> bool { !desk() && !THUMBS.load(Relaxed) && group_marker().exists() }
+
+/// Takes "now" and the time zone offset once, so bucket() is plain arithmetic while a folder is sorted and painted.
+fn bucket_refresh() {
+    use windows_sys::Win32::{Foundation::FILETIME, Storage::FileSystem::FileTimeToLocalFileTime};
+    let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() / 100) as i64) + 116_444_736_000_000_000;
+    let (utc, mut local) = (FILETIME { dwLowDateTime: now as u32, dwHighDateTime: (now >> 32) as u32 }, FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 });
+    let off = if unsafe { FileTimeToLocalFileTime(&utc, &mut local) } != 0 { ((local.dwHighDateTime as i64) << 32 | local.dwLowDateTime as i64) - now } else { 0 };
+    BCTX.set(((now + off) / DAY, off));
+}
+
+/// Index into BUCKETS of a FILETIME (UTC ticks).
+fn bucket(time: u64) -> i32 {
+    let (today, off) = BCTX.get();
+    match today - (time as i64 + off) / DAY {
+        i64::MIN..=0 => 0,
+        1 => 1,
+        2..=6 => 2,
+        7..=13 => 3,
+        14..=29 => 4,
+        30..=59 => 5,
+        60..=364 => 6,
+        _ => 7,
+    }
+}
+
+/// A heading row ("Today", ...) before the first row of each date group. Its name starts with '?', which no file can have.
+fn add_headers(rows: &mut Vec<Row>) {
+    if !group_on() { return; }
+    bucket_refresh();
+    let mut out = Vec::with_capacity(rows.len() + 8);
+    let mut last = -1;
+    for r in rows.drain(..) {
+        let b = bucket(r.time);
+        if b != last {
+            last = b;
+            out.push(Row { name: format!("?{}", BUCKETS[b as usize]), dir: false, size: 0, time: 0, icon: -1, thumb: -1, hdr: true });
+        }
+        out.push(r);
+    }
+    *rows = out;
 }
 
 /// Explorer's "Type" column in short form: "File folder", "TXT file", "File".
@@ -135,6 +237,7 @@ fn properties(path: &PathBuf) {
 
 /// New folder / new empty file with a free name ("New folder", "New folder (2)", ...).
 fn new_entry(dir: &PathBuf, base: &str, folder: bool) {
+    if zipx::split_zip(dir).is_some() { return; }
     let (stem, ext) = match base.rsplit_once('.') { Some((s, e)) if !folder => (s.to_string(), format!(".{e}")), _ => (base.to_string(), String::new()) };
     let path = (1..).map(|n| dir.join(if n == 1 { base.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| !p.exists());
     if let Some(p) = path { let _ = if folder { fs::create_dir(p) } else { fs::File::create(p).map(drop) }; }
@@ -144,6 +247,7 @@ fn new_entry(dir: &PathBuf, base: &str, folder: bool) {
 /// Copies and moves to another drive run in our own copier (jobs.rs: parallel on SSDs, unbuffered for big files); moves on the
 /// same drive (a rename), shell items, and folders that need elevation go through the shell.
 fn paste(h: HWND, dir: &PathBuf) {
+    if zipx::split_zip(dir).is_some() { return; } // an archive is read-only here
     let Some((paths, cut)) = sh::clip_get() else { return };
     let fast = jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
     if fast && !jobs::busy() {
@@ -157,17 +261,119 @@ fn paste(h: HWND, dir: &PathBuf) {
 const MENU_ZIP: u32 = 0x9001;
 const MENU_EXTRACT: u32 = 0x9002;
 const MENU_PIN: u32 = 0x9003;
+const MENU_RENAME: u32 = 0x9004;
+
+/// True while the window shows the inside of a .zip: read-only, its rows are no files on disk.
+fn in_zip() -> bool { zipx::split_zip(&cur_dir()).is_some() }
+
+fn warn(h: HWND, text: &str) {
+    unsafe { MessageBoxW(h, w(text).as_ptr(), w("WinRust Explorer").as_ptr(), MB_ICONWARNING) };
+}
+
+/// (archive, archive paths) when every one of `paths` is something inside one and the same .zip.
+fn zip_names(paths: &[PathBuf]) -> Option<(PathBuf, Vec<String>)> {
+    let mut arc = None;
+    let mut names = vec![];
+    for p in paths {
+        let (a, inner) = zipx::split_zip(p).filter(|(_, i)| !i.is_empty())?;
+        if arc.get_or_insert_with(|| a.clone()) != &a { return None; }
+        names.push(inner);
+    }
+    Some((arc?, names))
+}
+
+/// Things from an archive as real files in a temp folder: the clipboard, drag and "open with" need files on disk. One path per name.
+/// Folders of earlier days are cleaned up here.
+fn materialize(arc: &Path, names: &[String]) -> Result<Vec<PathBuf>, String> {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let root = env::temp_dir().join("WinRust-zip");
+    for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+        if e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > std::time::Duration::from_secs(86_400)) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+    let out = root.join(format!("{}-{}", std::process::id(), N.fetch_add(1, Relaxed)));
+    zipx::extract_some(arc, names, &out)?;
+    Ok(names.iter().map(|n| out.join(n.rsplit('/').next().unwrap_or(n))).collect())
+}
+
+/// `paths` as files on disk: unchanged, or taken out of the archive they are in first.
+fn real_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    match zip_names(paths) {
+        Some((arc, names)) => materialize(&arc, &names),
+        None => Ok(paths.to_vec()),
+    }
+}
+
+/// Enter / double click on a row.
+unsafe fn activate(h: HWND, p: PathBuf, is_dir: bool) {
+    // a file inside a zip: a real copy in the temp folder first
+    let p = match zip_names(std::slice::from_ref(&p)) {
+        Some((arc, names)) if !is_dir => match materialize(&arc, &names) {
+            Ok(mut v) => v.remove(0),
+            Err(e) => return warn(h, &e),
+        },
+        _ => p,
+    };
+    if is_dir && desk() { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p).spawn(); }
+    else if is_dir { load(h, p) }
+    else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && p.is_file() { load(h, p) } // a zip opens like a folder; "Extract here" is in its menu
+    else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
+    else { unsafe { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL) }; }
+}
+
+/// The menu for rows inside a zip. They are no shell items, so this is a small menu of our own.
+fn zip_menu(h: HWND, paths: &[PathBuf]) {
+    let id = unsafe {
+        let m = CreatePopupMenu();
+        for (i, t) in [(1usize, "Open"), (2, "Copy"), (3, "Extract here")] { AppendMenuW(m, MF_STRING, i, w(t).as_ptr()); }
+        let mut pt: POINT = std::mem::zeroed();
+        GetCursorPos(&mut pt);
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+        DestroyMenu(m);
+        id
+    };
+    let Some((arc, names)) = zip_names(paths) else { return };
+    match id {
+        1 => if let [p] = paths {
+            let is_dir = ST.with_borrow(|st| st.rows.iter().any(|r| r.dir && st.dir.join(&r.name) == *p));
+            unsafe { activate(h, p.clone(), is_dir) };
+        },
+        2 => match materialize(&arc, &names) {
+            Ok(v) => { let _ = sh::clip_set(h, &v, false); }
+            Err(e) => warn(h, &e),
+        },
+        3 => {
+            // next to the archive, in a new folder named after it; no progress yet (shortcut: fire and forget)
+            let (Some(parent), Some(stem)) = (arc.parent(), arc.file_stem()) else { return };
+            let out = jobs::free_name(parent, &stem.to_string_lossy(), true);
+            std::thread::spawn(move || _ = zipx::extract_some(&arc, &names, &out));
+        }
+        _ => {}
+    }
+}
 
 /// The shell menu for the selection, with our "Compress to ZIP" / "Extract here" on top.
 fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
+    if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
     let mut extra = vec![(MENU_ZIP, "Compress to ZIP")];
     if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
         extra.insert(0, (MENU_EXTRACT, "Extract here"));
     }
+    // the shell menu has no Rename here (it needs the shell's own folder view to answer it): the same edit box as F2
+    if paths.len() == 1 { extra.push((MENU_RENAME, "Rename")); }
     if let [p] = paths { if p.is_dir() { extra.push((MENU_PIN, if ui::pins().contains(p) { "Unpin from Quick access" } else { "Pin to Quick access" })); } }
     let picked = sh::show(h, paths, if jobs::busy() { &[] } else { &extra }).ok().flatten();
     match picked {
         Some(MENU_PIN) => ui::toggle_pin(&paths[0]),
+        Some(MENU_RENAME) => unsafe {
+            let (list, ..) = selected();
+            let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+            if i >= 0 {
+                SetFocus(list);
+                put(list, LVM_EDITLABELW, i as usize, 0);
+            }
+        },
         Some(MENU_ZIP) => {
             let base = if paths.len() == 1 { paths[0].file_stem().unwrap_or_default().to_string_lossy().into_owned() } else { dir.file_name().map_or("Archive".into(), |n| n.to_string_lossy().into_owned()) };
             let dest = jobs::free_name(dir, &format!("{base}.zip"), false);
@@ -178,12 +384,38 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     }
 }
 
+/// "Hide desktop icons" is a marker file, so it survives restarts.
+fn icons_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"WinRust\desktop-icons-hidden.txt") }
+fn small_marker() -> PathBuf { icons_marker().with_file_name("small-icons") }
+/// Desktop icon size: the system's large (32 px, default) or small (16 px) icons with a tighter grid. Same icon indexes in both.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_icon_size(list: HWND) {
+    let small = small_marker().exists();
+    let mut fi: SHFILEINFOW = std::mem::zeroed();
+    let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | if small { SHGFI_SMALLICON } else { SHGFI_LARGEICON });
+    put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, il as isize);
+    let (cx, cy) = if small { (76, 64) } else { (88, 96) };
+    put(list, LVM_SETICONSPACING, 0, ((ui::sc(cy) as isize) << 16) | ui::sc(cx) as isize);
+}
+fn icons_hidden() -> bool {
+    winrust_common::style::hide_desktop_icons() || icons_marker().exists()
+}
+fn set_icons_hidden(hide: bool) {
+    let m = icons_marker();
+    let _ = fs::remove_file(&m); // unified into winrust_common::style::hide_desktop_icons()
+    winrust_common::style::set_hide_desktop_icons(hide);
+    let list = ST.with_borrow(|st| st.list);
+    if !list.is_null() {
+        unsafe { ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW }) };
+    }
+}
+
 /// Right click on empty space: the folder's own menu.
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
     let m = CreatePopupMenu();
     if desk() {
-        let show = !winrust_common::style::hide_desktop_icons();
+        let show = !icons_hidden();
         let flags = MF_STRING | if show { MF_CHECKED } else { 0 };
         AppendMenuW(m, flags, 7, w(if winrust_common::english() { "Show desktop icons" } else { "Отображать значки рабочего стола" }).as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
@@ -191,6 +423,9 @@ unsafe fn bg_menu(h: HWND) {
     for (id, t) in [(1usize, "New folder"), (2, "New text file"), (3, "Paste"), (4, "Refresh"), (5, "Properties")] { AppendMenuW(m, MF_STRING, id, w(t).as_ptr()); }
     let disk = tool("wiztree");
     if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w("Disk usage (WinRust Disk)").as_ptr()); }
+    if desk() { for (id, l) in [(8usize, "Sort icons by name"), (9, "Sort icons by date"), (10, "Sort icons by size"), (11, "Arrange icons")] { AppendMenuW(m, MF_STRING, id, w(l).as_ptr()); } }
+    if !desk() { AppendMenuW(m, MF_STRING, 13, w(if group_on() { "No grouping" } else { "Group by date" }).as_ptr()); }
+    if desk() { AppendMenuW(m, MF_STRING, 12, w(if small_marker().exists() { "Large icons" } else { "Small icons" }).as_ptr()); }
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
     let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
@@ -198,10 +433,23 @@ unsafe fn bg_menu(h: HWND) {
     let dir = cur_dir();
     match id {
         7 => {
-            let hide = !winrust_common::style::hide_desktop_icons();
-            winrust_common::style::set_hide_desktop_icons(hide);
-            apply_desktop_icons(h);
+            set_icons_hidden(!icons_hidden());
+            InvalidateRect(h, ptr::null(), 1);
             return;
+        }
+        13 => {
+            let k = group_marker();
+            if group_on() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
+        }
+        12 => { // the grid changes with the size: icons are laid out again
+            let k = small_marker();
+            if k.exists() { let _ = fs::remove_file(&k); } else { let _ = fs::write(&k, "1"); }
+            apply_icon_size(ST.with_borrow(|st| st.list));
+            let _ = fs::remove_file(desk::pos_file());
+        }
+        8..=11 => { // the saved cells are dropped: reload lays every icon out again, down the columns in sort order
+            if id != 11 { SORT_COL.store([0, 1, 3][id as usize - 8], Relaxed); SORT_ASC.store(true, Relaxed); }
+            let _ = fs::remove_file(desk::pos_file());
         }
         6 => { // wiztree takes the drive letter and asks for admin rights itself
             let drive: String = dir.to_string_lossy().chars().take(2).collect();
@@ -222,9 +470,52 @@ unsafe fn apply_desktop_icons(h: HWND) {
     if !desk() { return; }
     let list = ST.with_borrow(|st| st.list);
     if !list.is_null() {
-        let hide = winrust_common::style::hide_desktop_icons();
+        let hide = icons_hidden();
         ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW });
         InvalidateRect(h, ptr::null(), 1);
+    }
+}
+
+/// Command line -> (folder to open, file to select there). Understands `/select,"C:\a\b.txt"` (what browsers and other
+/// apps pass for "show in folder"), a plain folder, or a plain file path (its folder, file selected).
+fn start_target() -> (PathBuf, Option<String>) {
+    let mut a = env::args().skip(1);
+    let mut p = a.next().unwrap_or_default();
+    if p.to_lowercase().starts_with("/select,") || p.to_lowercase().starts_with("--select") {
+        p = p.get(8..).unwrap_or("").trim_start_matches(',').to_string();
+        if p.is_empty() { p = a.next().unwrap_or_default(); }
+    }
+    let p = PathBuf::from(p.trim_matches('"'));
+    if p.as_os_str().is_empty() { return (PathBuf::from("C:\\"), None); }
+    match (p.is_file(), p.parent()) {
+        (true, Some(d)) => (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())),
+        _ => (p, None),
+    }
+}
+
+/// Another app asked the shell to show `p` in a folder window (SHOpenFolderAndSelectItems): open its folder here, select it, come to front.
+fn shell_select(h: isize, p: PathBuf) {
+    let h = h as HWND;
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
+    if !cur_dir().as_os_str().eq_ignore_ascii_case(dir.as_os_str()) { load(h, dir.to_path_buf()); }
+    select_row(&name.to_string_lossy());
+    unsafe {
+        if IsIconic(h) != 0 { ShowWindow(h, SW_RESTORE); }
+        SetForegroundWindow(h);
+    }
+}
+
+/// Selects and scrolls to the row called `name` in the current folder.
+fn select_row(name: &str) {
+    let (list, i) = ST.with_borrow(|st| (st.list, st.rows.iter().position(|r| r.name.eq_ignore_ascii_case(name))));
+    let Some(i) = i else { return };
+    unsafe {
+        let mut it: LVITEMW = std::mem::zeroed();
+        it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize); // the shell selects it alone
+        it.state = LVIS_SELECTED | LVIS_FOCUSED;
+        put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+        put(list, LVM_ENSUREVISIBLE, i, 0);
     }
 }
 
@@ -282,6 +573,14 @@ fn label(dir: &PathBuf) -> String {
 /// Rows of `dir`, folders first. Desktop mode merges the public desktop (absolute names) and hides hidden files.
 /// None = `dir` itself is unreadable.
 fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
+    if !desk() {
+        if let Some((arc, inner)) = zipx::split_zip(dir) { // inside a .zip: its entries are the rows
+            let mut rows: Vec<Row> = zipx::list_dir(&arc, &inner).ok()?.into_iter().map(|i| Row { name: i.name, dir: i.dir, size: i.size, time: zipx::dos_to_filetime(i.time), icon: -1, thumb: -2, hdr: false }).collect();
+            sort_rows(&mut rows, SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
+            add_headers(&mut rows);
+            return Some(rows);
+        }
+    }
     let mut dirs = vec![dir.clone()];
     if desk() { dirs.extend(sh::desktop_dirs().into_iter().skip(1)); }
     let mut rows = vec![];
@@ -295,6 +594,7 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
         }
     }
     sort_rows(&mut rows, SORT_COL.load(Relaxed), SORT_ASC.load(Relaxed));
+    add_headers(&mut rows);
     Some(rows)
 }
 
@@ -310,6 +610,7 @@ fn load(h: HWND, dir: PathBuf) {
         (st.list, st.tab, st.edit, st.active, st.rows.len())
     });
     unsafe { SetWindowTextW(edit, w(&dir.to_string_lossy()).as_ptr()) };
+    shellwin::navigated(&dir);
     ui::set_search(None); // a folder again: the pill shows its path
     tab_text(tab, active, &label(&dir), false);
     ui::nav_dirty(); // the pane highlights where we are
@@ -458,7 +759,7 @@ fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
         loop {
             i = put(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
             let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
-            sel.push(st.dir.join(&r.name));
+            if !r.hdr { sel.push(st.dir.join(&r.name)); }
         }
         (st.list, st.dir.clone(), sel)
     })
@@ -503,6 +804,7 @@ fn tab_close_at(h: HWND, i: usize) {
 
 fn toggle_view(h: HWND) {
     let (list, on) = ST.with_borrow_mut(|st| { st.thumbs = !st.thumbs; (st.list, st.thumbs) });
+    THUMBS.store(on, Relaxed);
     ui::row_height(list, !on);
     put(list, LVM_SETVIEW, if on { LV_VIEW_ICON } else { LV_VIEW_DETAILS } as usize, 0);
     reload(h);
@@ -520,10 +822,29 @@ fn search_focus() {
 
 /// Wallpaper for the desktop window.
 mod wall {
-    use windows_sys::Win32::{Graphics::Gdi::*, UI::WindowsAndMessaging::{IMAGE_BITMAP, LR_LOADFROMFILE, LoadImageW}};
+    use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*, UI::WindowsAndMessaging::{IMAGE_BITMAP, LR_LOADFROMFILE, LoadImageW}};
 
-    /// The BMP scaled ("fill": cropped to the screen's aspect) to cw x ch. 0 = no wallpaper file.
-    pub fn load(cw: i32, ch: i32) -> isize {
+    /// The part of a bw x bh picture that "fill" shows on a cw x ch screen: centered, cropped to the screen's aspect.
+    /// (x, y, w, h) in the picture.
+    pub fn fill_src(bw: i32, bh: i32, cw: i32, ch: i32) -> (i32, i32, i32, i32) {
+        let (sw, sh) = if bw as i64 * ch as i64 > bh as i64 * cw as i64 { (bh * cw / ch.max(1), bh) } else { (bw, bw * ch / cw.max(1)) };
+        ((bw - sw) / 2, (bh - sh) / 2, sw, sh)
+    }
+
+    /// Every monitor's rectangle, relative to the virtual screen's top-left (vx, vy).
+    fn monitors(vx: i32, vy: i32) -> Vec<RECT> {
+        unsafe extern "system" fn each(_: HMONITOR, _: HDC, r: *mut RECT, lp: isize) -> i32 {
+            unsafe { (*(lp as *mut Vec<RECT>)).push(*r) };
+            1
+        }
+        let mut v: Vec<RECT> = Vec::new();
+        unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), &mut v as *mut _ as isize) };
+        v.iter().map(|r| RECT { left: r.left - vx, top: r.top - vy, right: r.right - vx, bottom: r.bottom - vy }).collect()
+    }
+
+    /// The BMP for the whole virtual screen (vx, vy, cw x ch): scaled with "fill" onto each monitor on its own, so a second
+    /// monitor of another size or aspect gets a whole picture too. 0 = no wallpaper file.
+    pub fn load(vx: i32, vy: i32, cw: i32, ch: i32) -> isize {
         let Ok(base) = std::env::var("LOCALAPPDATA") else { return 0 };
         let path: Vec<u16> = format!(r"{base}\rs-shell\wallpaper.bmp").encode_utf16().chain([0]).collect();
         unsafe {
@@ -535,12 +856,29 @@ mod wall {
             let dst = CreateCompatibleBitmap(screen, cw, ch);
             let (sdc, ddc) = (CreateCompatibleDC(screen), CreateCompatibleDC(screen));
             let (o1, o2) = (SelectObject(sdc, src), SelectObject(ddc, dst));
+            PatBlt(ddc, 0, 0, cw, ch, BLACKNESS); // the gaps between monitors of different heights
             SetStretchBltMode(ddc, HALFTONE);
-            let (sw, sh) = if bm.bmWidth * ch > bm.bmHeight * cw { (bm.bmHeight * cw / ch, bm.bmHeight) } else { (bm.bmWidth, bm.bmWidth * ch / cw) };
-            StretchBlt(ddc, 0, 0, cw, ch, sdc, (bm.bmWidth - sw) / 2, (bm.bmHeight - sh) / 2, sw, sh, SRCCOPY);
+            let mut mons = monitors(vx, vy);
+            if mons.is_empty() { mons.push(RECT { left: 0, top: 0, right: cw, bottom: ch }); }
+            for m in mons {
+                let (mw, mh) = (m.right - m.left, m.bottom - m.top);
+                let (sx, sy, sw, sh) = fill_src(bm.bmWidth, bm.bmHeight, mw, mh);
+                StretchBlt(ddc, m.left, m.top, mw, mh, sdc, sx, sy, sw, sh, SRCCOPY);
+            }
             SelectObject(sdc, o1); SelectObject(ddc, o2);
             DeleteDC(sdc); DeleteDC(ddc); ReleaseDC(std::ptr::null_mut(), screen); DeleteObject(src);
             dst as isize
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn fill_crops_to_the_screen_aspect() {
+            assert_eq!(super::fill_src(1920, 1080, 1920, 1080), (0, 0, 1920, 1080));
+            assert_eq!(super::fill_src(1920, 1080, 1080, 1080), (420, 0, 1080, 1080)); // square screen: the sides go
+            assert_eq!(super::fill_src(1920, 1080, 2560, 1080), (0, 135, 1920, 810)); // ultrawide: top and bottom go
+            assert_eq!(super::fill_src(100, 100, 0, 0).2, 100); // no division by zero
         }
     }
 
@@ -708,12 +1046,77 @@ mod sh {
 
     /// The real shell context menu for `paths`, so 7-Zip/Git/etc. entries show up. `extra` = our own items on top
     /// (ids above the shell's range); returns the one picked, None when the shell handled the pick or nothing was picked.
+    /// The name Windows shows for its own "Send to > Compressed (zipped) folder": the stem of the .ZFSendToTarget file in SendTo.
+    pub(crate) fn system_zip_name() -> Option<String> {
+        let dir = PathBuf::from(std::env::var_os("APPDATA")?).join(r"Microsoft\Windows\SendTo");
+        let f = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ZFSendToTarget")))?;
+        f.file_stem().map(|s| s.to_string_lossy().into_owned())
+    }
+
+    /// Takes Windows' own zip entry out of the menu: our "Compress to ZIP" is the one. (Menus of other zip tools, 7-Zip etc., stay.)
+    unsafe fn hide_system_zip(cm: &IContextMenu, menu: HMENU) {
+        use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, GetMenuItemCount, GetMenuStringW, GetSubMenu, MF_BYPOSITION};
+        let Some(name) = system_zip_name() else { return };
+        // WM_INITMENUPOPUP: the Send to submenu fills itself only when it is opened
+        if let Ok(c2) = cm.cast::<IContextMenu2>() { let _ = unsafe { c2.HandleMenuMsg(0x0117, WPARAM(menu.0 as usize), LPARAM(0)) }; }
+        unsafe fn strip(m: HMENU, name: &str) { unsafe {
+            for i in (0..GetMenuItemCount(Some(m)).max(0)).rev() {
+                let mut b = [0u16; 256];
+                let n = GetMenuStringW(m, i as u32, Some(&mut b), MF_BYPOSITION);
+                if String::from_utf16_lossy(&b[..n.max(0) as usize]).replace('&', "").eq_ignore_ascii_case(name) {
+                    let _ = DeleteMenu(m, i as u32, MF_BYPOSITION);
+                    continue;
+                }
+                let sub = GetSubMenu(m, i);
+                if !sub.is_invalid() { strip(sub, name); }
+            }
+        } }
+        unsafe { strip(menu, &name) };
+    }
+
+    unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> BOOL {
+        unsafe { (*(lp.0 as *mut Vec<isize>)).push(h.0 as isize); }
+        TRUE
+    }
+
+    fn top_windows() -> Vec<isize> {
+        let mut v: Vec<isize> = vec![];
+        unsafe { let _ = EnumWindows(Some(collect), LPARAM(&mut v as *mut _ as isize)); }
+        v
+    }
+
+    /// Dialogs the shell opens for a command ("Open with" > choose another app, Properties) can land partly off screen on some
+    /// setups. For a few seconds after the command, any new window that sticks out of its monitor is moved back inside.
+    fn keep_on_screen(before: Vec<isize>) {
+        std::thread::spawn(move || unsafe {
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                for h in top_windows().into_iter().filter(|h| !before.contains(h)) {
+                    let h = HWND(h as *mut c_void);
+                    let mut r = RECT::default();
+                    if !IsWindowVisible(h).as_bool() || IsZoomed(h).as_bool() || GetWindowRect(h, &mut r).is_err() || r.right <= r.left { continue; }
+                    let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+                    let mon = windows::Win32::Graphics::Gdi::MonitorFromWindow(h, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+                    if !windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi).as_bool() { continue; }
+                    let a = mi.rcWork;
+                    if r.right - r.left > a.right - a.left || r.bottom - r.top > a.bottom - a.top { continue; } // maximized-like: not a stray dialog
+                    let x = r.left.min(a.right - (r.right - r.left)).max(a.left);
+                    let y = r.top.min(a.bottom - (r.bottom - r.top)).max(a.top);
+                    if (x, y) != (r.left, r.top) {
+                        let _ = SetWindowPos(h, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+            }
+        });
+    }
+
     pub fn show(h: *mut c_void, paths: &[PathBuf], extra: &[(u32, &str)]) -> Result<Option<u32>> {
         unsafe {
             let hwnd = HWND(h);
             let cm: IContextMenu = ui(hwnd, paths)?;
             let menu = CreatePopupMenu()?;
             cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
+            hide_system_zip(&cm, menu);
             if !extra.is_empty() {
                 let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
                 for (id, text) in extra.iter().rev() {
@@ -741,11 +1144,38 @@ mod sh {
                     ptInvoke: pt,
                     ..Default::default()
                 };
+                let before = top_windows();
                 cm.InvokeCommand(&ci as *const _ as *const CMINVOKECOMMANDINFO)?;
+                keep_on_screen(before);
             }
             DestroyMenu(menu)?;
             Ok(None)
         }
+    }
+
+    #[cfg(test)]
+    pub fn menu_dump(paths: &[PathBuf]) -> Vec<String> {
+        use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetMenuStringW, GetSubMenu, MF_BYPOSITION};
+        fn walk(m: HMENU, depth: usize, out: &mut Vec<String>) {
+            unsafe {
+                for i in 0..GetMenuItemCount(Some(m)).max(0) as u32 {
+                    let mut b = [0u16; 256];
+                    let n = GetMenuStringW(m, i, Some(&mut b), MF_BYPOSITION);
+                    out.push(format!("{}{} (id {})", "  ".repeat(depth), String::from_utf16_lossy(&b[..n.max(0) as usize]), GetMenuItemID(m, i as i32)));
+                    let sub = GetSubMenu(m, i as i32);
+                    if !sub.is_invalid() { walk(sub, depth + 1, out); }
+                }
+            }
+        }
+        let mut out = vec![];
+        unsafe {
+            let cm: IContextMenu = ui(HWND::default(), paths).unwrap();
+            let menu = CreatePopupMenu().unwrap();
+            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok().unwrap();
+            hide_system_zip(&cm, menu);
+            walk(menu, 0, &mut out);
+        }
+        out
     }
 
     /// Starts an OLE drag of `paths` (blocks until dropped).
@@ -780,13 +1210,17 @@ mod sh {
     fn effect(k: MODIFIERKEYS_FLAGS) -> DROPEFFECT { if k.0 & 8 != 0 { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } } // 8 = MK_CONTROL
 
     impl IDropTarget_Impl for DropT_Impl {
-        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = effect(k) }; Ok(()) }
-        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = effect(k) }; Ok(()) }
+        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
+        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
         fn DragLeave(&self) -> Result<()> { Ok(()) }
         fn Drop(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
             if super::desk::dragging() {
                 // desktop icons dropped back on the desktop: a move of the icons, not of the files (the dragger finishes it)
                 super::desk::dropped_here((pt.x, pt.y));
+                unsafe { *e = DROPEFFECT_NONE };
+                return Ok(());
+            }
+            if super::in_zip() { // nothing can be dropped into an archive here
                 unsafe { *e = DROPEFFECT_NONE };
                 return Ok(());
             }
@@ -826,7 +1260,15 @@ mod desk {
         static LIVE: Cell<bool> = const { Cell::new(false) }; // a live wallpaper is running in WORKERW
     }
 
-    fn pos_file() -> PathBuf {
+    /// The live-wallpaper window follows the desktop's size (monitors added, removed or resized).
+    pub unsafe fn size_workerw(cw: i32, ch: i32) {
+        let ww = WORKERW.get() as HWND;
+        if !ww.is_null() && IsWindow(ww) != 0 {
+            MoveWindow(ww, 0, 0, cw, ch, 1);
+        }
+    }
+
+    pub fn pos_file() -> PathBuf {
         PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\desktop-icons.txt")
     }
 
@@ -1082,11 +1524,37 @@ fn prev_word_range(buf: &[u16], caret: usize) -> (usize, usize) {
     (i, end)
 }
 
-/// Address bar subclass: Enter / Esc go to the main window, Ctrl+A selects all, Ctrl+Backspace deletes a word/segment cleanly.
-unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+/// Ctrl+Backspace in an edit box (it arrives as WM_CHAR 0x7F): deletes back to the start of the previous word or path segment.
+unsafe fn delete_word(h: HWND) {
     const EM_GETSEL: u32 = 0x00B0;
     const EM_SETSEL: u32 = 0x00B1;
     const EM_REPLACESEL: u32 = 0x00C2;
+    unsafe {
+        let (mut s, mut e) = (0u32, 0u32);
+        SendMessageW(h, EM_GETSEL, &mut s as *mut u32 as usize, &mut e as *mut u32 as isize);
+        if s == e && s > 0 {
+            let len = GetWindowTextLengthW(h).max(0) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+            let (a, b) = prev_word_range(&buf[..got], s as usize);
+            SendMessageW(h, EM_SETSEL, a, b as isize);
+        }
+        let empty = [0u16];
+        SendMessageW(h, EM_REPLACESEL, 1, empty.as_ptr() as isize);
+    }
+}
+
+/// Rename box subclass: Ctrl+Backspace deletes the previous word/segment.
+unsafe extern "system" fn label_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if m == WM_CHAR && wp == 0x7F { delete_word(h); return 0; }
+        CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(LABEL_OLD.load(std::sync::atomic::Ordering::Relaxed)), h, m, wp, lp)
+    }
+}
+
+/// Address bar subclass: Enter / Esc go to the main window, Ctrl+A selects all, Ctrl+Backspace deletes a word/segment cleanly.
+unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    const EM_SETSEL: u32 = 0x00B1;
     unsafe {
         if matches!(wp, 13 | 27) && matches!(m, WM_KEYDOWN | WM_CHAR) {
             if m == WM_KEYDOWN { PostMessageW(GetAncestor(h, GA_ROOT), WM_GO, wp, 0); }
@@ -1100,21 +1568,7 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
         if m == WM_CHAR && wp == 1 {
             return 0;
         }
-        // Ctrl+Backspace in Win32 EDIT sends WM_CHAR 0x7F (DEL box glyph): delete the previous word/path segment instead
-        if m == WM_CHAR && wp == 0x7F {
-            let (mut s, mut e) = (0u32, 0u32);
-            SendMessageW(h, EM_GETSEL, &mut s as *mut u32 as usize, &mut e as *mut u32 as isize);
-            if s == e && s > 0 {
-                let len = GetWindowTextLengthW(h).max(0) as usize;
-                let mut buf = vec![0u16; len + 1];
-                let got = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
-                let (a, b) = prev_word_range(&buf[..got], s as usize);
-                SendMessageW(h, EM_SETSEL, a, b as isize);
-            }
-            let empty = [0u16];
-            SendMessageW(h, EM_REPLACESEL, 1, empty.as_ptr() as isize);
-            return 0;
-        }
+        if m == WM_CHAR && wp == 0x7F { delete_word(h); return 0; }
         CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(EDIT_OLD.load(std::sync::atomic::Ordering::Relaxed)), h, m, wp, lp)
     }
 }
@@ -1151,14 +1605,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     // system large icons; indexes are shared with the small list, so icon_of() works unchanged
                     let big = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
                     put(list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, big as isize);
-                    put(list, LVM_SETICONSPACING, 0, ((ui::sc(96) as isize) << 16) | ui::sc(88) as isize);
+                    apply_icon_size(list);
                     // transparent background (the desktop paints it) and shadowed labels, readable on light wallpapers too
                     let ex = LVS_EX_TRANSPARENTBKGND | 0x0080_0000; // LVS_EX_TRANSPARENTSHADOWTEXT
                     put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
                     for msg in [LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR] { put(list, msg, 0, CLR_NONE); }
                     put(list, LVM_SETTEXTCOLOR, 0, 0x00FF_FFFF);
-                    let (cw, ch) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-                    WALL.set((wall::load(cw, ch), cw, ch));
+                    reload_wall();
                     // grey (not ClearType) smoothing: on a live wallpaper the labels sit on a colour key, where ClearType leaves coloured fringes
                     put(list, WM_SETFONT, windows_sys::Win32::Graphics::Gdi::CreateFontW(-ui::sc(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, w(ui::ui_face()).as_ptr()) as usize, 1);
                     // like explorer's desktop: wallpaper apps look for a SHELLDLL_DefView under Progman
@@ -1177,30 +1630,40 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.tabs = vec![PathBuf::new()]; });
                 if !desk() { ui::place_edit(tab); }
                 let _ = sh::register_drop(list as _, h as isize);
+                if desk() && icons_hidden() { ShowWindow(list, SW_HIDE); }
                 // live wallpaper: the list is see-through (colour key), so over empty desktop OLE finds the wallpaper window under it,
                 // and walks up from there to the desktop window: it must accept the drop too
                 if desk() { let _ = sh::register_drop(h as _, h as isize); }
-                let start = if desk() { sh::desktop_dirs().into_iter().next().unwrap_or_default() } else { env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")) };
+                let (start, pick) = if desk() { (sh::desktop_dirs().into_iter().next().unwrap_or_default(), None) } else { start_target() };
                 load(h, start);
                 apply_desktop_icons(h);
+                if let Some(name) = pick { select_row(&name); }
+                if !desk() {
+                    shellwin::navigated(&cur_dir());
+                    shellwin::register(h as isize);
+                }
                 0
             }
             // the bar came, went or changed size (it sets the work area), or the screen changed: the icon list follows
             WM_SETTINGCHANGE | WM_DISPLAYCHANGE if desk() => {
                 if m == WM_DISPLAYCHANGE {
-                    SetWindowPos(h, HWND_BOTTOM, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_NOACTIVATE); // WM_SIZE lays out
+                    reload_wall(); // monitors came, went or changed resolution: each one gets its picture again
+                    let (vx, vy, vw, vh) = virt();
+                    SetWindowPos(h, HWND_BOTTOM, vx, vy, vw, vh, SWP_NOACTIVATE); // WM_SIZE lays out
+                    InvalidateRect(h, ptr::null(), 1);
                 } else if wp == SPI_SETWORKAREA as usize {
-                    let (list, mut r) = (ST.with_borrow(|st| st.list), std::mem::zeroed::<RECT>());
-                    GetClientRect(h, &mut r);
-                    MoveWindow(list, 0, desk_top(), r.right, (r.bottom - desk_top() - desk_bottom()).max(0), 1);
+                    place_desk_list(ST.with_borrow(|st| st.list));
                 }
                 0
             }
+            // mouse buttons 4 / 5 (and keyboard media keys) arrive as APPCOMMAND_BROWSER_BACKWARD / _FORWARD
+            0x0319 if !desk() && matches!((lp >> 16) & 0x7FF, 1 | 2) => { nav(h, (lp >> 16) & 0x7FF == 1); 1 }
             WM_SIZE => {
                 let list = ST.with_borrow(|st| st.list);
                 let (cw, ch) = ((lp & 0xFFFF) as i32, ((lp >> 16) & 0xFFFF) as i32);
                 if desk() {
-                    MoveWindow(list, 0, desk_top(), cw, (ch - desk_top() - desk_bottom()).max(0), 1);
+                    place_desk_list(list);
+                    desk::size_workerw(cw, ch);
                 } else {
                     ui::layout_children(cw, ch);
                     InvalidateRect(h, ptr::null(), 0);
@@ -1219,6 +1682,19 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     7 => reload(h),
                     8 => toggle_view(h),
                     9 => search_focus(),
+                    10..=14 => {
+                        let (list, dir, paths) = selected();
+                        match wp {
+                            10 | 11 if !paths.is_empty() => match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, wp == 10 && !in_zip()); } Err(e) => warn(h, &e) },
+                            12 => { paste(h, &dir); reload(h); }
+                            13 if !in_zip() => {
+                                let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+                                if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
+                            }
+                            14 if !paths.is_empty() && !in_zip() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); reload(h); }
+                            _ => {}
+                        }
+                    }
                     20 => { if let Some(p) = ui::nav_path(lp as usize) { load(h, p); } } // a folder in the left pane
                     21 => { if let Some(p) = ui::crumb_path(lp as usize) { load(h, p); } } // a part of the path in the address pill
                     _ => {}
@@ -1249,11 +1725,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) };
+                                let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
                             }
+                            if r.hdr { if it.mask & LVIF_IMAGE != 0 { it.iImage = I_IMAGENONE; } return; }
                             if it.mask & LVIF_IMAGE != 0 && *thumbs {
                                 if r.thumb == -2 {
                                     r.thumb = -1;
@@ -1268,13 +1745,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     LVN_ITEMACTIVATE => {
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
-                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).map(|r| (st.dir.join(&r.name), r.dir)));
-                        if let Some((p, is_dir)) = hit {
-                            if is_dir && desk() { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p).spawn(); }
-                            else if is_dir { load(h, p) }
-                            else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
-                            else { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL); }
-                        }
+                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (st.dir.join(&r.name), r.dir)));
+                        if let Some((p, is_dir)) = hit { activate(h, p, is_dir); }
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
                         let (_, dir, paths) = selected();
@@ -1286,7 +1758,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         SORT_COL.store(c, Relaxed);
                         SORT_ASC.store(asc, Relaxed);
                         let n = ST.with_borrow_mut(|st| {
+                            st.rows.retain(|r| !r.hdr);
                             sort_rows(&mut st.rows, c, asc);
+                            add_headers(&mut st.rows);
                             st.rows.iter_mut().for_each(|r| r.thumb = -2); // rows moved: thumbnails are asked for again
                             st.rows.len()
                         });
@@ -1295,6 +1769,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     LVN_BEGINDRAG => {
                         let (_, _, paths) = selected();
+                        let paths = match real_paths(&paths) { Ok(p) => p, Err(e) => { warn(h, &e); return 0; } }; // out of a zip: real files first
                         drag_log(&format!("BEGINDRAG desk={} selected={}", desk(), paths.len()));
                         if !paths.is_empty() {
                             if desk() { let p = (*(lp as *const NMLISTVIEW)).ptAction; desk::drag_start((p.x, p.y)); }
@@ -1313,10 +1788,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let (list, dir, paths) = selected();
                         match vk {
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
-                            0x2E if !paths.is_empty() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
-                            // Space on a picture: a quick look in photoview (pictures only: videos and text are not previewed yet)
-                            0x20 if !desk() => if let (Some(p), Some(exe)) = (paths.first().filter(|p| is_pic(p)), tool("photoview")) { let _ = std::process::Command::new(exe).arg(p).spawn(); },
-                            0x71 => {
+                            0x1B if jobs::busy() => { jobs::cancel(); return 0; } // Esc stops packing / unpacking
+                            0x2E if !paths.is_empty() && !in_zip() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
+                            // Space: a quick look. Pictures open in photoview, videos / text / anything else in its default app
+                            0x20 if !desk() => if let Some(p) = paths.first().filter(|p| p.is_file()) { activate(h, p.clone(), false); },
+                            0x71 if !in_zip() => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
                             }
@@ -1328,7 +1804,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 return 0;
                             }
                             0x5D if !paths.is_empty() => item_menu(h, &dir, &paths),
-                            0x43 | 0x58 if ctrl && !paths.is_empty() => { let _ = sh::clip_set(h, &paths, vk == 0x58); return 0; }
+                            0x43 | 0x58 if ctrl && !paths.is_empty() => { // from a zip: real files in the temp folder, and only a copy (nothing can be cut out of an archive)
+                                match real_paths(&paths) { Ok(p) => { let _ = sh::clip_set(h, &p, vk == 0x58 && !in_zip()); } Err(e) => warn(h, &e) }
+                                return 0;
+                            }
                             0x41 if ctrl => { // Ctrl+A: select all (state mask LVIS_SELECTED, item -1 = every row)
                                 let mut it: LVITEMW = std::mem::zeroed();
                                 it.stateMask = LVIS_SELECTED;
@@ -1351,6 +1830,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             _ => return 0,
                         }
                         reload(h);
+                    }
+                    LVN_BEGINLABELEDITW => {
+                        let hdr = ST.with_borrow(|st| usize::try_from((*(lp as *const NMLVDISPINFOW)).item.iItem).ok().and_then(|i| st.rows.get(i)).is_some_and(|r| r.hdr));
+                        if hdr { return 1; } // a heading cannot be renamed
+                        let e = SendMessageW(ST.with_borrow(|st| st.list), LVM_GETEDITCONTROL, 0, 0) as HWND;
+                        if e != 0 as HWND { LABEL_OLD.store(SetWindowLongPtrW(e, GWLP_WNDPROC, label_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed); }
                     }
                     LVN_ENDLABELEDITW => {
                         let it = &(*(lp as *const NMLVDISPINFOW)).item;
@@ -1375,6 +1860,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_APP => { reload(h); 0 }
+            shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
                 reload(h);
@@ -1412,8 +1898,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     let p = PathBuf::from(trimmed.trim_matches('"'));
                     if let Some(q) = trimmed.strip_prefix('?') {
                         if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); return 0; } // keep the query in the bar
-                    } else if p.is_dir() {
-                        load(h, p);
+                    } else if p.is_dir() || zipx::split_zip(&p).is_some() {
+                        load(h, p); // folder or a path inside a .zip
                     } else if !trimmed.is_empty() && !trimmed.contains(['\\', '/', ':']) {
                         // typing a keyword like "games" directly in the bar without '?' searches right away
                         search(h, trimmed);
@@ -1427,7 +1913,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
-            WM_DESTROY => { PostQuitMessage(0); 0 }
+            WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }
@@ -1458,10 +1944,23 @@ fn main() {
             RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: inst, lpszClassName: pm.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hIcon: LoadIconW(inst, 1 as _), hbrBackground: bg, ..std::mem::zeroed() });
             RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(desk::workerw_proc), hInstance: inst, lpszClassName: w("WorkerW").as_ptr(), ..std::mem::zeroed() });
             RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: inst, lpszClassName: w("SHELLDLL_DefView").as_ptr(), ..std::mem::zeroed() });
-            let d = CreateWindowExW(WS_EX_TOOLWINDOW, pm.as_ptr(), w("rs-desktop").as_ptr(), WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), 0 as _, 0 as _, inst, ptr::null());
+            let (vx, vy, vw, vh) = virt(); // every monitor: the wallpaper reaches the secondary ones too (#67)
+            let d = CreateWindowExW(WS_EX_TOOLWINDOW, pm.as_ptr(), w("rs-desktop").as_ptr(), WS_POPUP, vx, vy, vw, vh, 0 as _, 0 as _, inst, ptr::null());
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
-            CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1000), ui::sc(660), 0 as _, 0 as _, inst, ptr::null());
+            // where it was last closed, maximized again if it was (#71); a first start gets the default size
+            let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1000), ui::sc(660), 0 as _, 0 as _, inst, ptr::null());
+            match saved_place() {
+                // the same API that saved it: rcNormalPosition is in work-area coordinates, which CreateWindow does not use
+                Some((max, r)) => {
+                    let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                    wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+                    wp.showCmd = if max { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL } as u32;
+                    wp.rcNormalPosition = r;
+                    SetWindowPlacement(win, &wp);
+                }
+                None => { ShowWindow(win, SW_SHOWNORMAL); }
+            }
         }
         let mut msg = std::mem::zeroed();
         while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
@@ -1479,9 +1978,60 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_place_parses_and_rejects_junk() {
+        let (max, r) = super::parse_place("max 10 20 1010 680").unwrap();
+        assert!(max);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (10, 20, 1010, 680));
+        assert!(!super::parse_place("normal -1900 5 -900 700").unwrap().0); // a monitor left of the primary
+        assert!(super::parse_place("max 0 0 50 50").is_none()); // collapsed
+        assert!(super::parse_place("max 0 0 800").is_none());
+        assert!(super::parse_place("big 0 0 800 600").is_none());
+        assert!(super::parse_place("").is_none());
+    }
+
+    #[test]
+    fn a_zip_opens_like_a_folder_and_gives_real_files() {
+        let d = std::env::temp_dir().join(format!("rx-zipview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("f.txt"), "hello").unwrap();
+        let z = d.join("a.zip");
+        let mut w = zipx::Writer::new(fs::File::create(&z).unwrap());
+        w.add_prepared(zipx::prepare("inner/f.txt".into(), &d.join("f.txt")).unwrap()).unwrap();
+        w.add_prepared(zipx::prepare("top.txt".into(), &d.join("f.txt")).unwrap()).unwrap();
+        w.finish().unwrap();
+        let names = |dir: &PathBuf| rows_of(dir).unwrap().into_iter().map(|r| format!("{}{}", r.name, if r.dir { "/" } else { "" })).collect::<Vec<_>>();
+        assert_eq!(names(&z), ["inner/", "top.txt"]); // folders first
+        assert_eq!(names(&z.join("inner")), ["f.txt"]);
+        assert!(rows_of(&d.join("nothing.zip")).is_none());
+        let paths = [z.join("inner").join("f.txt"), z.join("top.txt")];
+        let real = real_paths(&paths).unwrap();
+        assert!(real.iter().all(|p| p.is_file() && fs::read_to_string(p).unwrap() == "hello"), "{real:?}");
+        assert_eq!(real_paths(&[d.join("f.txt")]).unwrap(), [d.join("f.txt")], "ordinary files stay as they are");
+        assert!(zip_names(&[z.join("top.txt"), d.join("f.txt")]).is_none(), "mixed selections are not archive selections");
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(real[0].parent().unwrap());
+    }
+
+    /// By hand (needs the real shell): `cargo test -p rust-explorer system_zip -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn system_zip_is_not_in_the_menu() {
+        sh::init();
+        let f = std::env::temp_dir().join("rx-menu-dump.txt");
+        std::fs::write(&f, "x").unwrap();
+        let menu = sh::menu_dump(&[f.clone()]);
+        let _ = std::fs::remove_file(f);
+        println!("{}", menu.join("
+"));
+        assert!(menu.iter().any(|l| l.contains("Se&nd to") || l.contains("Send to") || l.contains("&Delete") || l.contains("Delete")), "the menu is there");
+        if let Some(n) = sh::system_zip_name() { assert!(!menu.iter().any(|l| l.trim().starts_with(&n)), "{n} should be gone"); }
+    }
+
     use super::*;
 
-    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), dir, size, time, icon: -1, thumb: -2 } }
+    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), dir, size, time, icon: -1, thumb: -2 , hdr: false } }
     fn names(v: &[Row]) -> Vec<&str> { v.iter().map(|r| r.name.as_str()).collect() }
 
     #[test]
