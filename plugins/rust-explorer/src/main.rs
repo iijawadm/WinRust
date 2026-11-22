@@ -182,6 +182,12 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
     let m = CreatePopupMenu();
+    if desk() {
+        let show = !winrust_common::style::hide_desktop_icons();
+        let flags = MF_STRING | if show { MF_CHECKED } else { 0 };
+        AppendMenuW(m, flags, 7, w(if winrust_common::english() { "Show desktop icons" } else { "Отображать значки рабочего стола" }).as_ptr());
+        AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
+    }
     for (id, t) in [(1usize, "New folder"), (2, "New text file"), (3, "Paste"), (4, "Refresh"), (5, "Properties")] { AppendMenuW(m, MF_STRING, id, w(t).as_ptr()); }
     let disk = tool("wiztree");
     if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w("Disk usage (WinRust Disk)").as_ptr()); }
@@ -191,6 +197,12 @@ unsafe fn bg_menu(h: HWND) {
     DestroyMenu(m);
     let dir = cur_dir();
     match id {
+        7 => {
+            let hide = !winrust_common::style::hide_desktop_icons();
+            winrust_common::style::set_hide_desktop_icons(hide);
+            apply_desktop_icons(h);
+            return;
+        }
         6 => { // wiztree takes the drive letter and asks for admin rights itself
             let drive: String = dir.to_string_lossy().chars().take(2).collect();
             if let Some(exe) = disk { let _ = std::process::Command::new(exe).arg(drive).spawn(); }
@@ -202,6 +214,18 @@ unsafe fn bg_menu(h: HWND) {
         _ => {}
     }
     if id != 0 { reload(h); }
+}
+
+/// Applies the shared "hide desktop icons" setting to our desktop's SysListView32.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_desktop_icons(h: HWND) {
+    if !desk() { return; }
+    let list = ST.with_borrow(|st| st.list);
+    if !list.is_null() {
+        let hide = winrust_common::style::hide_desktop_icons();
+        ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW });
+        InvalidateRect(h, ptr::null(), 1);
+    }
 }
 
 /// Back / forward along the visited-folder trail.
@@ -306,31 +330,69 @@ fn ask(d: char, q: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Fills the list with search hits from every drive's service. Rows hold absolute paths, so joining them
-/// onto the current dir still yields the right file. Blocks the UI for the duration of the query (fast).
-/// Never call with ST borrowed.
+/// Relevance key for ranking search hits across multiple drives: user files/folders and exact name matches first, OS junk last.
+fn search_rank(path: &str, first_term: &str) -> (u8, u8, usize) {
+    let low = path.to_lowercase();
+    let junk = ["\\winsxs\\", "\\windowsapps\\", "\\$recycle.bin\\", "\\servicing\\packages\\"].iter().any(|j| low.contains(j)) as u8;
+    let name = low.rsplit('\\').next().unwrap_or(&low);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let rank = if name == first_term || stem == first_term {
+        0
+    } else if name.starts_with(first_term) {
+        1
+    } else {
+        2
+    };
+    (junk, rank, path.len())
+}
+
+/// Fills the list with search hits from every drive's service, falling back to (or supplementing with)
+/// local folder search when a drive has no rust-search service. Never call with ST borrowed.
 fn search(h: HWND, q: &str) {
     let mut rows = vec![];
+    let mut seen = std::collections::HashSet::<String>::new();
     let mut more = String::new();
-    let mut indexed = false; // some drive had a rust-search service
-    for d in 'A'..='Z' {
-        let Some(reply) = ask(d, q) else { continue };
-        indexed = true;
-        for line in reply.lines() {
-            if line.starts_with("... ") { more = format!(", {}", line.trim_start_matches("... ")); continue; }
-            let m = fs::metadata(line).ok();
-            rows.push(row(line.to_string(), m.as_ref()));
+    let mut indexed_drives = vec![];
+    let mut ask_all = |query: &str, rows: &mut Vec<Row>, seen: &mut std::collections::HashSet<String>, more: &mut String, drives: &mut Vec<char>| {
+        for d in 'A'..='Z' {
+            let Some(reply) = ask(d, query) else { continue };
+            if !drives.contains(&d) { drives.push(d); }
+            for line in reply.lines() {
+                if line.starts_with("... ") { *more = format!(", {}", line.trim_start_matches("... ")); continue; }
+                if line.is_empty() || !seen.insert(line.to_lowercase()) { continue; }
+                let m = fs::metadata(line).ok();
+                rows.push(row(line.to_string(), m.as_ref()));
+            }
+        }
+    };
+    ask_all(q, &mut rows, &mut seen, &mut more, &mut indexed_drives);
+    if rows.is_empty() && !indexed_drives.is_empty() {
+        let alt = flip_layout(q);
+        if alt != q {
+            ask_all(&alt, &mut rows, &mut seen, &mut more, &mut indexed_drives);
+            if !rows.is_empty() { more = format!(" for \u{201C}{alt}\u{201D}{more}"); }
         }
     }
-    if !indexed {
-        // no rust-search installed: look through the current folder and below instead
-        let (local, cut, flipped) = local_search(&cur_dir(), q);
-        if flipped { more = format!(" for \u{201C}{}\u{201D}", flip_layout(q)); } // typed in the wrong layout: shown what was meant
-        rows = local;
-        if cut { more += ", stopped early: narrow the search"; }
+    let cur = cur_dir();
+    let cur_drive = cur.to_string_lossy().chars().next().map(|c| c.to_ascii_uppercase());
+    let cur_indexed = cur_drive.is_some_and(|d| indexed_drives.contains(&d));
+    if indexed_drives.is_empty() || !cur_indexed || rows.is_empty() {
+        // current drive has no rust-search service (or no hits yet): search the current folder too
+        let (local, cut, flipped) = local_search(&cur, q);
+        if flipped && rows.is_empty() { more = format!(" for \u{201C}{}\u{201D}", flip_layout(q)); }
+        for r in local {
+            if seen.insert(r.name.to_lowercase()) {
+                rows.push(r);
+            }
+        }
+        if cut && indexed_drives.is_empty() { more += ", stopped early: narrow the search"; }
+    }
+    let first_term = q.split_whitespace().next().unwrap_or("").to_lowercase();
+    if !first_term.is_empty() {
+        rows.sort_by_key(|r| search_rank(&r.name, &first_term));
     }
     let n = rows.len();
-    let where_ = if indexed { "" } else { " in this folder" };
+    let where_ = if !indexed_drives.is_empty() { "" } else { " in this folder" };
     let title = if n == 0 { format!("search: {q} - nothing{where_}") } else { format!("search: {q} - {n} hits{where_}{more}") };
     ui::set_search(Some(q.to_string()));
     unsafe { SetWindowTextW(h, w(&title).as_ptr()) };
@@ -347,26 +409,34 @@ fn flip_layout(q: &str) -> String {
     q.chars().map(|c| en.iter().position(|&x| x == c).map(|i| ru[i]).or_else(|| ru.iter().position(|&x| x == c).map(|i| en[i])).unwrap_or(c)).collect()
 }
 
-/// Files and folders under `dir` whose name contains `q` (any case), as rows with absolute names. Walks breadth-first and
-/// stops after LOCAL_MAX hits or LOCAL_MS so a search from C:\ cannot hang the window. The same walk also matches `q` typed
-/// in the other keyboard layout; those hits are used only when `q` itself found nothing.
+/// Files and folders under `dir` whose name contains all terms in `q` (any case), as rows with absolute names.
+/// Walks breadth-first, skipping massive OS/cache trees unless searching inside them, and stops after LOCAL_MAX hits or LOCAL_MS.
 /// Returns (rows, stopped early, rows are for the other layout).
-/// shortcut: blocks the UI while it walks (up to LOCAL_MS); move to a thread if deeper searches are wanted.
 fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
     const LOCAL_MAX: usize = 500;
-    const LOCAL_MS: u128 = 1500;
-    let (q, t0) = (q.to_lowercase(), std::time::Instant::now());
-    let alt = flip_layout(&q);
+    const LOCAL_MS: u128 = 2500;
+    const SKIP_DIRS: [&str; 6] = ["winsxs", "$recycle.bin", "system volume information", "node_modules", ".git", "servicing"];
+    let terms: Vec<String> = q.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if terms.is_empty() { return (vec![], false, false); }
+    let alt_terms: Vec<String> = flip_layout(q).split_whitespace().map(|t| t.to_lowercase()).collect();
+    let has_alt = alt_terms != terms;
+    let t0 = std::time::Instant::now();
     let (mut out, mut other, mut queue) = (vec![], vec![], std::collections::VecDeque::from([dir.to_path_buf()]));
     let mut cut = false;
     'walk: while let Some(d) = queue.pop_front() {
         for e in fs::read_dir(&d).into_iter().flatten().flatten() {
             if out.len() >= LOCAL_MAX || t0.elapsed().as_millis() > LOCAL_MS { cut = true; break 'walk; }
             let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() && !ft.is_symlink() { queue.push_back(e.path()); } // no junction loops
             let name = e.file_name().to_string_lossy().to_lowercase();
             let hit = |v: &mut Vec<Row>| v.push(row(e.path().to_string_lossy().into_owned(), e.metadata().ok().as_ref()));
-            if name.contains(&q) { hit(&mut out); } else if alt != q && other.len() < LOCAL_MAX && name.contains(&alt) { hit(&mut other); }
+            if terms.iter().all(|t| name.contains(t.as_str())) {
+                hit(&mut out);
+            } else if has_alt && other.len() < LOCAL_MAX && alt_terms.iter().all(|t| name.contains(t.as_str())) {
+                hit(&mut other);
+            }
+            if ft.is_dir() && !ft.is_symlink() && !SKIP_DIRS.contains(&name.as_str()) {
+                queue.push_back(e.path()); // no junction loops, skip massive OS/cache trees
+            }
         }
     }
     if out.is_empty() && !other.is_empty() { (other, cut, true) } else { (out, cut, false) }
@@ -965,6 +1035,10 @@ mod desk {
             if bmp != 0 { wall::paint(wp as _, bmp, cw, ch); } else { let mut r: RECT = std::mem::zeroed(); GetClientRect(h, &mut r); FillRect(wp as _, &r, GetStockObject(BLACK_BRUSH) as _); }
             return 1;
         }
+        if m == WM_RBUTTONUP {
+            PostMessageW(GetParent(h), WM_RBUTTONUP, wp, lp);
+            return 0;
+        }
         DefWindowProcW(h, m, wp, lp)
     }
 
@@ -1048,9 +1122,9 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
 unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if m == winrust_common::style::msg() {
-            // the topbar switched the WinRust style: take it now (the desktop's list keeps its see-through colours)
+            // the topbar switched the WinRust style or desktop icon visibility: take it now
             winrust_common::style::reload();
-            if desk() { InvalidateRect(h, ptr::null(), 1); } else { ui::restyle(h); }
+            if desk() { apply_desktop_icons(h); } else { ui::restyle(h); }
             return 0;
         }
         match m {
@@ -1108,6 +1182,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 if desk() { let _ = sh::register_drop(h as _, h as isize); }
                 let start = if desk() { sh::desktop_dirs().into_iter().next().unwrap_or_default() } else { env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")) };
                 load(h, start);
+                apply_desktop_icons(h);
                 0
             }
             // the bar came, went or changed size (it sets the work area), or the screen changed: the icon list follows
@@ -1292,7 +1367,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 }
                 0
             }
-            WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
+            WM_RBUTTONUP if desk() => { bg_menu(h); 0 }
+            WM_SETFOCUS => {
+                if !(desk() && winrust_common::style::hide_desktop_icons()) {
+                    SetFocus(ST.with_borrow(|st| st.list));
+                }
+                0
+            }
             WM_APP => { reload(h); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
@@ -1326,11 +1407,19 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 if wp == 13 {
                     let mut buf = vec![0u16; GetWindowTextLengthW(edit) as usize + 1];
                     let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32) as usize;
-                    let p = PathBuf::from(String::from_utf16_lossy(&buf[..n]).trim().trim_matches('"'));
                     let text = String::from_utf16_lossy(&buf[..n]);
-                    if let Some(q) = text.trim().strip_prefix('?') {
+                    let trimmed = text.trim();
+                    let p = PathBuf::from(trimmed.trim_matches('"'));
+                    if let Some(q) = trimmed.strip_prefix('?') {
                         if !q.trim().is_empty() { search(h, q.trim()); SetFocus(list); return 0; } // keep the query in the bar
-                    } else if p.is_dir() { load(h, p); }
+                    } else if p.is_dir() {
+                        load(h, p);
+                    } else if !trimmed.is_empty() && !trimmed.contains(['\\', '/', ':']) {
+                        // typing a keyword like "games" directly in the bar without '?' searches right away
+                        search(h, trimmed);
+                        SetFocus(list);
+                        return 0;
+                    }
                 }
                 SetWindowTextW(edit, w(&cur_dir().to_string_lossy()).as_ptr()); // also undoes a bad path / Esc
                 SetFocus(list);
@@ -1492,5 +1581,14 @@ mod search_tests {
         let (a2, b2) = super::prev_word_range(&q, q.len());
         assert_eq!(String::from_utf16_lossy(&q[..a2]), "? cyber ");
         assert_eq!(b2, q.len());
+    }
+
+    #[test]
+    fn search_rank_prefers_exact_user_folders_over_system_junk() {
+        let user_games = super::search_rank(r"D:\Games", "games");
+        let nested = super::search_rank(r"C:\Program Files\Epic Games\Launcher\EpicGamesLauncher.exe", "games");
+        let winsxs = super::search_rank(r"C:\Windows\WinSxS\amd64_games\games.exe", "games");
+        assert!(user_games < nested, "exact folder should rank before noisy substring");
+        assert!(nested < winsxs, "user files should always rank before WinSxS");
     }
 }

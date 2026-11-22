@@ -225,6 +225,10 @@ thread_local! {
     static BAT: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // (percent or -1 = no battery, on AC)
     static VOL: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // (percent or -1 = unknown, muted)
     static WIFI: Cell<i32> = const { Cell::new(-1) }; // signal quality 0..100, -1 = not on wifi
+    static HAS_WIFI: Cell<bool> = const { Cell::new(false) }; // true when the PC has a Wi-Fi adapter
+    static HAS_ETH: Cell<bool> = const { Cell::new(false) }; // true when the PC has a hardware Ethernet adapter
+    static ETH_UP: Cell<bool> = const { Cell::new(false) }; // true when an Ethernet cable is connected
+    static ETH_SPEED: Cell<u64> = const { Cell::new(0) }; // active Ethernet link speed in bits/sec
     static INET: Cell<bool> = const { Cell::new(true) }; // Windows sees a way to the internet (any adapter)
     static TICK: Cell<u32> = const { Cell::new(0) };
     static EP: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) };
@@ -586,7 +590,12 @@ unsafe fn tip_text(h: i32) -> String {
         WIFI_I => match net() {
             Link::Wifi(q) => tf!("Wi‑Fi · сигнал {q}%", "Wi‑Fi · signal {q}%"),
             Link::NoInternet(_) => t!("Wi‑Fi подключён, но интернета нет", "Wi‑Fi connected, no internet").into(),
-            Link::Cable => t!("Интернет по кабелю", "Internet over a cable").into(),
+            Link::Cable => match eth_speed_text(ETH_SPEED.get()) {
+                Some(sp) => tf!("Ethernet · подключено ({sp})", "Ethernet · connected ({sp})"),
+                None => t!("Ethernet · подключено", "Ethernet · connected").into(),
+            },
+            Link::CableNoInternet => t!("Ethernet · без интернета", "Ethernet · no internet").into(),
+            Link::CableOffline => t!("Ethernet · не подключено", "Ethernet · not connected").into(),
             Link::Offline => t!("Нет подключения к сети", "Not connected").into(),
         },
         VOL_I => vol_tip(),
@@ -1144,9 +1153,71 @@ thread_local! {
     static WLAN: Cell<usize> = const { Cell::new(0) }; // WLAN client handle, opened once (opening it talks to wlansvc every time)
 }
 
+/// Formats an Ethernet link speed (bits/sec) as "1 Gbps" / "100 Mbps".
+pub(crate) fn eth_speed_text(bps: u64) -> Option<String> {
+    match bps / 1_000_000 {
+        0 => None,
+        m if m >= 1000 => {
+            if m % 1000 == 0 {
+                Some(tf!("{} Гбит/с", "{} Gbps", m / 1000))
+            } else {
+                Some(tf!("{:.1} Гбит/с", "{:.1} Gbps", m as f64 / 1000.0))
+            }
+        }
+        m => Some(tf!("{} Мбит/с", "{} Mbps", m)),
+    }
+}
+
+/// Checks real hardware network adapters via GetAdaptersAddresses + GetIfEntry2:
+/// returns (has_wifi, has_ethernet, ethernet_up, ethernet_speed_bps).
+unsafe fn read_adapters() -> (bool, bool, bool, u64) {
+    use windows_sys::Win32::NetworkManagement::IpHelper::*;
+    const IF_ETHERNET: u32 = 6;
+    const IF_WIFI: u32 = 71;
+    const OPER_UP: i32 = 1;
+    let flags = GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut n = 16 * 1024u32;
+    let mut buf: Vec<u64> = vec![0; n as usize / 8 + 1];
+    for _ in 0..3 {
+        let rc = GetAdaptersAddresses(0, flags, null(), buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH, &mut n);
+        if rc == ERROR_BUFFER_OVERFLOW {
+            buf = vec![0; n as usize / 8 + 1];
+            continue;
+        }
+        if rc != ERROR_SUCCESS {
+            break;
+        }
+        let (mut has_wifi, mut has_eth, mut eth_up, mut eth_speed) = (false, false, false, 0u64);
+        let mut p = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !p.is_null() {
+            let a = &*p;
+            if a.IfType == IF_ETHERNET || a.IfType == IF_WIFI {
+                let mut row: MIB_IF_ROW2 = zeroed();
+                row.InterfaceLuid = a.Luid;
+                let hw = GetIfEntry2(&mut row) == ERROR_SUCCESS && row.InterfaceAndOperStatusFlags._bitfield & 1 != 0;
+                if hw {
+                    if a.IfType == IF_WIFI {
+                        has_wifi = true;
+                    } else {
+                        has_eth = true;
+                        if a.OperStatus == OPER_UP {
+                            eth_up = true;
+                            eth_speed = eth_speed.max(a.TransmitLinkSpeed);
+                        }
+                    }
+                }
+            }
+            p = a.Next;
+        }
+        return (has_wifi, has_eth, eth_up, eth_speed);
+    }
+    (false, false, false, 0)
+}
+
 unsafe fn read_wifi() {
     let mut h: HANDLE = WLAN.get() as HANDLE;
     let mut q = -1;
+    let mut wlan_has = false;
     if h.is_null() {
         let mut ver = 0u32;
         if WlanOpenHandle(2, null(), &mut ver, &mut h) != 0 {
@@ -1161,6 +1232,7 @@ unsafe fn read_wifi() {
             WLAN.set(0);
         } else {
             let l = &*list;
+            wlan_has = l.dwNumberOfItems > 0;
             for i in 0..l.dwNumberOfItems as usize {
                 let ifc = &*l.InterfaceInfo.as_ptr().add(i);
                 let (mut size, mut data) = (0u32, null_mut());
@@ -1172,6 +1244,11 @@ unsafe fn read_wifi() {
             WlanFreeMemory(list as *const _);
         }
     }
+    let (ad_wifi, has_eth, eth_up, eth_speed) = read_adapters();
+    HAS_WIFI.set(wlan_has || ad_wifi);
+    HAS_ETH.set(has_eth);
+    ETH_UP.set(eth_up);
+    ETH_SPEED.set(eth_speed);
     WIFI.set(q);
     // Windows' own verdict (the same one its tray icon shows): a connection without internet is not "online"
     use windows_sys::Win32::{NetworkManagement::IpHelper::GetNetworkConnectivityHint, Networking::WinSock::{NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess, NetworkConnectivityLevelHintInternetAccess}};
@@ -1184,21 +1261,34 @@ unsafe fn read_wifi() {
 }
 
 /// What the network icon shows.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Link {
-    Wifi(i32),      // on wifi with internet, signal 0..100
+    Wifi(i32),       // on wifi with internet, signal 0..100
     NoInternet(i32), // on wifi, but no way out
-    Cable,          // internet over ethernet
-    Offline,        // no connection at all
+    Cable,           // internet over ethernet
+    CableNoInternet, // ethernet cable connected, no internet
+    CableOffline,    // ethernet-only PC (no Wi-Fi adapter), cable unplugged
+    Offline,         // no connection at all (Wi-Fi PC or unknown)
+}
+
+fn net_state(wifi_q: i32, has_wifi: bool, eth_up: bool, has_eth: bool, inet: bool) -> Link {
+    if eth_up {
+        return if inet { Link::Cable } else { Link::CableNoInternet };
+    }
+    if wifi_q >= 0 {
+        return if inet { Link::Wifi(wifi_q) } else { Link::NoInternet(wifi_q) };
+    }
+    if inet {
+        Link::Cable
+    } else if has_eth && !has_wifi {
+        Link::CableOffline
+    } else {
+        Link::Offline
+    }
 }
 
 fn net() -> Link {
-    match (WIFI.get(), INET.get()) {
-        (q, true) if q >= 0 => Link::Wifi(q),
-        (q, false) if q >= 0 => Link::NoInternet(q),
-        (_, true) => Link::Cable,
-        _ => Link::Offline,
-    }
+    net_state(WIFI.get(), HAS_WIFI.get(), ETH_UP.get(), HAS_ETH.get(), INET.get())
 }
 
 /// Wi-Fi arcs lit for a signal of `q` percent: 1..3.
@@ -1280,17 +1370,76 @@ unsafe fn chevron(dc: HDC, cx: i32, cy: i32, s: i32, deg: f32, c: u32) {
     GdipDeleteGraphics(g);
 }
 
+/// Anti-aliased Ethernet symbol (Windows 11 style monitor + RJ45 cable plug) centered on (cx, cy), `s` px tall.
+/// `mark`: 0 none, 1 a cross (disconnected), 2 an exclamation mark (connected, no internet).
+pub(crate) unsafe fn eth_glyph(dc: HDC, cx: i32, cy: i32, s: i32, on: u32, bg_col: u32, mark: u8) {
+    let mut g: *mut GpGraphics = null_mut();
+    if GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
+        return;
+    }
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    let argb = |c: u32| 0xFF00_0000 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255);
+    let pen = |c: u32, w: f32| {
+        let mut p: *mut GpPen = null_mut();
+        GdipCreatePen1(argb(c), w, UnitPixel, &mut p);
+        GdipSetPenStartCap(p, LineCapRound);
+        GdipSetPenEndCap(p, LineCapRound);
+        p
+    };
+    let (sf, w) = (s as f32, (s as f32 * 0.105).max(1.4));
+    let (cxf, cyf) = (cx as f32, cy as f32);
+    let p = pen(on, w);
+    // monitor screen outline on the right side of the glyph
+    let (ml, mr, mt, mb) = (cxf - sf * 0.12, cxf + sf * 0.44, cyf - sf * 0.34, cyf + sf * 0.10);
+    GdipDrawLine(g, p, ml, mt, mr, mt);
+    GdipDrawLine(g, p, mr, mt, mr, mb);
+    GdipDrawLine(g, p, mr, mb, ml, mb);
+    GdipDrawLine(g, p, ml, mb, ml, mt);
+    // monitor stand neck and base
+    let mx = (ml + mr) * 0.5;
+    let base_y = cyf + sf * 0.28;
+    GdipDrawLine(g, p, mx, mb, mx, base_y);
+    GdipDrawLine(g, p, mx - sf * 0.16, base_y, mx + sf * 0.16, base_y);
+    // Ethernet cable + RJ45 plug head on the left side
+    let px = cxf - sf * 0.37;
+    GdipDrawLine(g, p, px, cyf - sf * 0.18, px, base_y);
+    GdipDrawLine(g, p, px - sf * 0.08, cyf - sf * 0.24, px + sf * 0.08, cyf - sf * 0.24);
+    GdipDrawLine(g, p, px - sf * 0.08, cyf - sf * 0.24, px - sf * 0.08, cyf - sf * 0.06);
+    GdipDrawLine(g, p, px + sf * 0.08, cyf - sf * 0.24, px + sf * 0.08, cyf - sf * 0.06);
+    GdipDrawLine(g, p, px - sf * 0.08, cyf - sf * 0.06, px + sf * 0.08, cyf - sf * 0.06);
+    GdipDeletePen(p);
+    // status badge in the lower right, matching wifi_glyph
+    if mark > 0 {
+        let (bx, by, br) = (cxf + sf * 0.36, cyf + sf * 0.22, sf * 0.25);
+        let mut bg: *mut GpSolidFill = null_mut();
+        GdipCreateSolidFill(argb(bg_col), &mut bg);
+        GdipFillEllipse(g, bg as *mut GpBrush, bx - br, by - br, 2.0 * br, 2.0 * br);
+        GdipDeleteBrush(bg as *mut GpBrush);
+        let c = if mark == 1 { on } else { WARN };
+        let mp = pen(c, (w * 0.9).max(1.4));
+        let d = br * 0.5;
+        if mark == 1 {
+            GdipDrawLine(g, mp, bx - d, by - d, bx + d, by + d);
+            GdipDrawLine(g, mp, bx + d, by - d, bx - d, by + d);
+        } else {
+            GdipDrawLine(g, mp, bx, by - d * 1.2, bx, by + d * 0.2);
+            GdipDrawLine(g, mp, bx, by + d * 0.95, bx, by + d * 1.0);
+        }
+        GdipDeletePen(mp);
+    }
+    GdipDeleteGraphics(g);
+}
+
 /// The network icon of the bar and the panels, for the current state.
-unsafe fn net_icon(dc: HDC, cx: i32, cy: i32, s: i32, f_glyph: HFONT) {
+unsafe fn net_icon(dc: HDC, cx: i32, cy: i32, s: i32, _f_glyph: HFONT) {
     let (on, off) = (pal().text, mix(pal().dim, pal().bg, 0.45));
     match net() {
         Link::Wifi(q) => wifi_glyph(dc, cx, cy, s, arcs_lit(q), on, off, 0),
         Link::NoInternet(q) => wifi_glyph(dc, cx, cy, s, arcs_lit(q), mix(on, pal().bg, 0.3), off, 2),
         Link::Offline => wifi_glyph(dc, cx, cy, s, 0, on, mix(pal().dim, pal().bg, 0.2), 1),
-        Link::Cable => {
-            SelectObject(dc, f_glyph);
-            text(dc, "\u{E839}", RECT { left: cx - s, top: cy - s, right: cx + s, bottom: cy + s }, on, DT_CENTER);
-        }
+        Link::Cable => eth_glyph(dc, cx, cy, s, on, pal().bg, 0),
+        Link::CableNoInternet => eth_glyph(dc, cx, cy, s, mix(on, pal().bg, 0.25), pal().bg, 2),
+        Link::CableOffline => eth_glyph(dc, cx, cy, s, mix(on, pal().dim, 0.35), pal().bg, 1),
     }
 }
 
@@ -1351,19 +1500,31 @@ struct Layout {
     clock: (i32, i32),
 }
 
+fn compute_x0_bw(w: i32, apps_left: i32, left_edge: i32, gap: i32, min_bw: i32, max_bw: i32, pad: i32, n: i32, fixed: i32, left_align: bool) -> (i32, i32) {
+    if left_align {
+        let avail = (apps_left - pad - left_edge).max(min_bw);
+        let bw = (((avail + gap) / n.max(1)) - gap).clamp(min_bw, max_bw);
+        return (left_edge, bw);
+    }
+    let margin = (w - apps_left) + pad; // keep the button group centered and clear of both sides
+    let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(min_bw, max_bw);
+    // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
+    // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
+    let right_limit = w - margin - (n * (bw + gap) - gap);
+    let x0 = ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(left_edge);
+    (x0, bw)
+}
+
 fn layout(w: i32) -> Layout {
     let gap = sc(4);
     let clock = (w - sc(96), w - sc(6));
-    let sys = (clock.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), clock.0 - sc(4));
+    let sys = (clock.0 - sc(4) - sc(116 + if BAT.get().0 >= 0 { 72 } else { 0 }), clock.0 - sc(4));
     let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
-    let margin = (w - apps.0) + sc(8); // keep the button group centered and clear of both sides
     let n = BTNS.with_borrow(|b| b.len()) as i32 + 1; // + the search slot
-    let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(44));
-    // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
     let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 2).min(n);
-    // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
-    let right_limit = w - margin - (n * (bw + gap) - gap);
-    Layout { x0: ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, apps, sys, clock } // clear of the gear
+    let left_edge = sc(GEAR_X.0 + GEAR_X.1 + 6); // clear of the gear
+    let (x0, bw) = compute_x0_bw(w, apps.0, left_edge, gap, sc(16), sc(44), sc(8), n, fixed, i18n::style::left_align() && !vert());
+    Layout { x0, bw, gap, apps, sys, clock }
 }
 
 unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
@@ -1379,7 +1540,7 @@ unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
     }
     if x >= l.sys.0 {
         let d = x - l.sys.0;
-        return if d < sc(42) { LANG } else if d < sc(74) { WIFI_I } else if d < sc(106) { VOL_I } else { BAT_I };
+        return if d < sc(42) { LANG } else if d < sc(74) { WIFI_I } else if BAT.get().0 < 0 || d < sc(106) { VOL_I } else { BAT_I };
     }
     if x >= l.apps.0 {
         return TAPP + (x - l.apps.0) / sc(24);
@@ -1947,7 +2108,7 @@ unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
-    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), INET.get(), EXPLORER_UP.load(Relaxed), clock_texts(), lang_name()).hash(&mut h);
+    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), INET.get(), EXPLORER_UP.load(Relaxed), i18n::style::left_align(), clock_texts(), lang_name()).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
     h.finish()
 }
@@ -2563,6 +2724,35 @@ unsafe fn open_launcher() -> bool {
     true
 }
 
+/// When Windows Explorer (not rs-shell) hosts the desktop, sync its desktop icon list visibility too.
+unsafe fn sync_explorer_desktop_icons(hide: bool) {
+    let mut def = null_mut();
+    let pm = FindWindowW(wide("Progman").as_ptr(), wide("Program Manager").as_ptr());
+    if !pm.is_null() {
+        def = FindWindowExW(pm, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null());
+    }
+    if def.is_null() {
+        let mut ww = null_mut();
+        loop {
+            ww = FindWindowExW(null_mut(), ww, wide("WorkerW").as_ptr(), null());
+            if ww.is_null() {
+                break;
+            }
+            let d = FindWindowExW(ww, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null());
+            if !d.is_null() {
+                def = d;
+                break;
+            }
+        }
+    }
+    if !def.is_null() {
+        let lv = FindWindowExW(def, null_mut(), wide("SysListView32").as_ptr(), null());
+        if !lv.is_null() {
+            ShowWindow(lv, if hide { SW_HIDE } else { SW_SHOW });
+        }
+    }
+}
+
 /// The gear's menu: the UI style (saved for the other WinRust programs) and putting the windows side by side.
 unsafe fn style_menu() {
     let bar = BAR.load(Relaxed) as HWND;
@@ -2570,6 +2760,8 @@ unsafe fn style_menu() {
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
     items.push(fly::MItem::new(t!("Скрывать панель автоматически", "Hide the bar automatically")).on(i18n::style::autohide()));
+    items.push(fly::MItem::new(t!("Значки панели слева", "Align taskbar to left")).on(i18n::style::left_align()));
+    items.push(fly::MItem::new(t!("Скрыть значки рабочего стола", "Hide desktop icons")).on(i18n::style::hide_desktop_icons()));
     let sides = [(i18n::style::Side::Bottom, t!("Панель снизу", "Bar at the bottom")), (i18n::style::Side::Left, t!("Панель слева", "Bar on the left")), (i18n::style::Side::Right, t!("Панель справа", "Bar on the right"))];
     for (k, (s, n)) in sides.iter().enumerate() {
         let mut it = fly::MItem::new(*n).on(i18n::style::side() == *s);
@@ -2580,7 +2772,8 @@ unsafe fn style_menu() {
     items.push(fly::MItem::new(t!("Блокировать Win в играх", "Lock Win key in games")).hint("Win+Shift+G").on(i18n::gaming::win_lock()));
     let head = (null_mut(), "\u{E713}", t!("Стиль", "Style").to_string(), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs").to_string());
     let tile = i18n::style::ALL.len();
-    let game_idx = tile + 5; // after tile (0), autohide (1), and 3 sides (2,3,4)
+    let sides_idx = tile + 4; // after tile (0), autohide (1), left_align (2), hide_desktop_icons (3)
+    let game_idx = sides_idx + 3; // after 3 sides
     fly::menu(tip_cx(&bar_layout(bar), GEAR), Some(head), items, move |i| match i18n::style::ALL.get(i) {
         Some(&s) => {
             i18n::style::set_style(s);
@@ -2592,6 +2785,15 @@ unsafe fn style_menu() {
             place(bar); // the reserved strip comes or goes with it
             bar_anim(bar);
         }
+        None if i == tile + 2 => {
+            i18n::style::set_left_align(!i18n::style::left_align());
+            InvalidateRect(bar, null(), 0);
+        }
+        None if i == tile + 3 => {
+            let hide = !i18n::style::hide_desktop_icons();
+            i18n::style::set_hide_desktop_icons(hide);
+            sync_explorer_desktop_icons(hide);
+        }
         None if i == game_idx => {
             i18n::gaming::set_auto_game(!i18n::gaming::auto_game());
             update_game_mode(FULLSCREEN.load(Relaxed));
@@ -2599,8 +2801,8 @@ unsafe fn style_menu() {
         None if i == game_idx + 1 => {
             i18n::gaming::set_win_lock(!i18n::gaming::win_lock());
         }
-        None if i > tile + 1 && i < game_idx => {
-            i18n::style::set_side([i18n::style::Side::Bottom, i18n::style::Side::Left, i18n::style::Side::Right][i - tile - 2]);
+        None if i >= sides_idx && i < game_idx => {
+            i18n::style::set_side([i18n::style::Side::Bottom, i18n::style::Side::Left, i18n::style::Side::Right][i - sides_idx]);
             place(bar);
             bar_anim(bar);
         }
@@ -2713,7 +2915,15 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         // left: the language picker; right: straight to the next one (Win+Space is explorer's, gone under rs-shell)
         LANG if left => lang_menu(BAR.load(Relaxed) as HWND),
         LANG => next_lang(BAR.load(Relaxed) as HWND),
-        WIFI_I => fly::toggle(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
+        WIFI_I => {
+            if left {
+                fly::toggle(fly::Kind::Quick);
+            } else if HAS_WIFI.get() {
+                fly::toggle(fly::Kind::Wifi); // right click: the Wi-Fi network list
+            } else {
+                open(&wide("ms-settings:network-status")); // wired-only PC: open Network settings directly
+            }
+        }
         VOL_I if !left && !mid => audio_menu(), // right click on speaker: instant audio output selector
         VOL_I | BAT_I => fly::toggle(fly::Kind::Quick),
         CLOCK if left => fly::toggle(fly::Kind::Cal),
@@ -2821,6 +3031,12 @@ unsafe fn appbar_new(hwnd: HWND) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg != 0 && msg == i18n::style::msg() {
+        i18n::style::reload();
+        place(hwnd);
+        InvalidateRect(hwnd, null(), 0);
+        return 0;
+    }
     if msg != 0 && msg == SH_MSG.get() {
         if wp == 5 && lp != 0 {
             min_rect(lp as *mut ShellHookInfo, hwnd); // HSHELL_GETMINRECT
@@ -3045,7 +3261,11 @@ fn main() {
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
         load_pins();
         fly::init(GetModuleHandleW(null()));
+        quick::refresh(); // probe Bluetooth / wireless radios early so Quick Settings hides missing hardware immediately
         thread::spawn(fly::load_apps);
+        if i18n::style::hide_desktop_icons() {
+            sync_explorer_desktop_icons(true);
+        }
         thread::spawn(winrust_common::mem::auto_loop); // standby purge when memory runs short, switched on from the task manager's Speed page
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");
@@ -3111,17 +3331,30 @@ fn main() {
 mod tests {
     #[test]
     fn network_icon_state() {
-        use super::{INET, Link, WIFI, arcs_lit, net};
-        let at = |q: i32, inet: bool| {
-            WIFI.set(q);
-            INET.set(inet);
-            net()
-        };
-        assert!(at(80, true) == Link::Wifi(80));
-        assert!(at(80, false) == Link::NoInternet(80)); // wifi without a way out: the warning icon
-        assert!(at(-1, true) == Link::Cable);
-        assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out wifi icon
+        use super::{Link, arcs_lit, eth_speed_text, net_state};
+        assert_eq!(net_state(80, true, false, false, true), Link::Wifi(80));
+        assert_eq!(net_state(80, true, false, false, false), Link::NoInternet(80)); // wifi without a way out: warning icon
+        assert_eq!(net_state(-1, false, true, true, true), Link::Cable);
+        assert_eq!(net_state(-1, false, true, true, false), Link::CableNoInternet); // wired without internet: ethernet + warning
+        assert_eq!(net_state(-1, false, false, true, false), Link::CableOffline); // wired-only PC unplugged: crossed-out ethernet, never wifi
+        assert_eq!(net_state(80, true, true, true, true), Link::Cable); // ethernet wins when cable is connected
+        assert_eq!(net_state(-1, true, false, false, false), Link::Offline); // wifi PC offline: crossed-out wifi
         assert_eq!((arcs_lit(0), arcs_lit(40), arcs_lit(100)), (1, 2, 3));
+        assert_eq!(eth_speed_text(0), None);
+        assert_eq!(eth_speed_text(1_000_000_000).as_deref(), Some("1 Гбит/с"));
+        assert_eq!(eth_speed_text(2_500_000_000).as_deref(), Some("2.5 Гбит/с"));
+        assert_eq!(eth_speed_text(100_000_000).as_deref(), Some("100 Мбит/с"));
+    }
+
+    #[test]
+    fn left_align_pins_buttons_after_gear() {
+        use super::compute_x0_bw;
+        let (x_center, bw_center) = compute_x0_bw(1920, 1600, 48, 4, 16, 44, 8, 6, 6, false);
+        let (x_left, bw_left) = compute_x0_bw(1920, 1600, 48, 4, 16, 44, 8, 6, 6, true);
+        assert!(x_center > 500, "center alignment should center buttons: {x_center}");
+        assert_eq!(x_left, 48);
+        assert_eq!(bw_center, 44);
+        assert_eq!(bw_left, 44);
     }
 
     #[test]

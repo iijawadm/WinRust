@@ -450,35 +450,53 @@ fn contains_ci(name: &str, t: &str) -> bool {
     }
 }
 
-/// Ranked paths (exact name, then name starts with first term, then the rest; shorter names first) and total hit count.
+/// Ranked paths (apps, exact/prefix matches, user folders & files, shorter paths first; OS component stores last) and total hit count.
 fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
-    // Shortcuts (.lnk) are candidates first: Start Menu entries are how apps get found, and a plain
-    // name-length cut could drop "Google Chrome.lnk" behind hundreds of chrome_*.pak files.
+    // Protect exact matches (e.g. a folder named "Games" or file "games.txt") alongside shortcuts/.exe
+    // so they are never truncated behind thousands of noisy substring matches.
     let mut hits: Vec<(u8, u8, usize, u32)> = idx.par_filter_map(|rec, n| {
         if !terms.iter().all(|t| contains_ci(n, t)) {
             return None;
         }
         let n = n.to_lowercase(); // only for the few hits
-        let rank = if n == terms[0] { 0 } else if n.starts_with(&terms[0]) { 1 } else { 2 };
-        Some((!(n.ends_with(".lnk") || n.ends_with(".exe")) as u8, rank, n.len(), rec))
+        let stem = n.rsplit_once('.').map_or(n.as_str(), |(s, _)| s);
+        let rank = if n == terms[0] || stem == terms[0] {
+            0
+        } else if n.starts_with(&terms[0]) {
+            1
+        } else {
+            2
+        };
+        let keep = !(rank == 0 || n.ends_with(".lnk") || n.ends_with(".exe")) as u8;
+        Some((keep, rank, n.len(), rec))
     });
     let total = hits.len();
-    // shortcut: ties beyond the best CAND candidates are cut in arbitrary order; raise CAND if that ever shows.
-    const CAND: usize = 1000;
+    const CAND: usize = 4000;
     if hits.len() > CAND {
         hits.select_nth_unstable(CAND - 1);
         hits.truncate(CAND);
     }
-    // Order: Start Menu apps, other shortcuts (.lnk), .exe files, everything else; inside a tier by name match rank;
-    // ties: OS component stores (WinSxS, WindowsApps) last, then shorter paths first.
+    // Order: OS component stores / Recycle Bin last; then Start Menu apps, other shortcuts (.lnk),
+    // prefix/exact .exe files, exact-name folders/files (e.g. C:\Games), other .exe files, everything else;
+    // within each tier: name match rank, then shorter paths first.
     let mut paths: Vec<(u8, u8, u8, usize, String)> = hits
         .into_iter()
         .map(|(_, rank, _, f)| {
             let p = full_path(idx, drive, f);
             let l = p.to_lowercase();
-            let tier = if l.ends_with(".lnk") { if l.contains(START_MENU) { 0 } else { 1 } } else if l.ends_with(".exe") { 2 } else { 3 };
             let junk = JUNK.iter().any(|j| l.contains(j)) as u8;
-            (tier, rank, junk, p.len(), p)
+            let tier = if l.ends_with(".lnk") {
+                if l.contains(START_MENU) { 0 } else { 1 }
+            } else if l.ends_with(".exe") && rank <= 1 {
+                2
+            } else if rank == 0 {
+                3
+            } else if l.ends_with(".exe") {
+                4
+            } else {
+                5
+            };
+            (junk, tier, rank, p.len(), p)
         })
         .collect();
     paths.sort_unstable();
@@ -487,7 +505,7 @@ fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
 
 const START_MENU: &str = "\\start menu\\programs\\";
 
-const JUNK: [&str; 2] = ["\\winsxs\\", "\\windowsapps\\"];
+const JUNK: [&str; 4] = ["\\winsxs\\", "\\windowsapps\\", "\\$recycle.bin\\", "\\servicing\\packages\\"];
 
 fn render(idx: &Index, drive: char, terms: &[String]) -> String {
     let (paths, total) = query(idx, drive, terms);
@@ -890,6 +908,18 @@ mod tests {
         assert_eq!(p[1], "C:\\Users\\Docs\\Report Final.TXT");
         assert_eq!(query(&idx, 'C', &["report".into(), "txt".into()]).1, 1);
         assert_eq!(query(&idx, 'C', &["nope".into()]).1, 0);
+    }
+
+    #[test]
+    fn exact_folder_beats_substring_exes_and_winsxs() {
+        let mut idx = sample();
+        idx.insert(40, 0, "Games");
+        idx.insert(41, 10, "games.exe"); // inside WinSxS
+        idx.insert(42, 6, "EpicGamesHelperService.exe"); // substring .exe match
+        let (p, _) = query(&idx, 'C', &["games".into()]);
+        assert_eq!(p[0], "C:\\Games");
+        assert_eq!(p[1], "C:\\Users\\Docs\\EpicGamesHelperService.exe");
+        assert_eq!(p[2], "C:\\WinSxS\\games.exe");
     }
 
     #[test]

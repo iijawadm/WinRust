@@ -16,6 +16,17 @@ pub enum Kind {
     Menu, // right-click menu of the bar
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QTile {
+    Ethernet,
+    Wifi,
+    Bluetooth,
+    Airplane,
+    Accessibility,
+    EnergySaver,
+    LiveCaptions,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     VolSlide,
@@ -24,7 +35,7 @@ enum Act {
     AudioDrop,        // toggles the audio output dropdown inside Quick Settings
     AudioDev(usize),  // selects audio output device index from AUDIO_DEVS
     WifiSwitch,
-    Tile(u8),
+    Tile(QTile),
     WifiMore,
     Net(usize),
     NetOff, // the connected network's Disconnect button (shown on hover)
@@ -303,8 +314,8 @@ pub fn start_toggle(path: &str) {
 
 static EXE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Programs that have no Start menu shortcut (a loose loliland.exe): asks rust-search for .exe files matching what is typed
-/// and adds them to the app list, where the normal ranking picks them up. Debounced; the panel repaints when they arrive.
+/// Finds matching files, folders and loose programs through `rs.exe` (rust-search) so Start search
+/// also surfaces folders like "Games" and documents, not just Start Menu shortcuts. Debounced.
 fn find_loose_exes(hw: HWND) {
     let q = QUERY.with_borrow(|q| q.trim().to_string());
     let gen_ = EXE_GEN.fetch_add(1, Relaxed) + 1;
@@ -321,14 +332,42 @@ fn find_loose_exes(hw: HWND) {
         let Ok(o) = Command::new(&rs).arg(&q).creation_flags(NO_WINDOW).output() else { return };
         let mut apps = APPS.lock().unwrap();
         let mut added = false;
-        for line in String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.to_lowercase().ends_with(".exe")).take(12) {
+        let mut count = 0usize;
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if count >= 16 {
+                break;
+            }
+            if line.is_empty() || line.starts_with("... ") {
+                continue;
+            }
+            let low = line.to_lowercase();
+            // skip noisy OS binaries and build/cache metadata; keep apps, shortcuts, folders, and user files
+            if low.contains(r"\winsxs\") || low.contains(r"\windowsapps\") || low.contains(r"\$recycle.bin\") {
+                continue;
+            }
+            let p = std::path::Path::new(line);
+            let is_dir = p.is_dir();
+            if !is_dir {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                if matches!(ext.as_str(), "dll" | "sys" | "mui" | "cat" | "winmd" | "tlb" | "ocx" | "tmp" | "etl" | "log" | "dat" | "pak" | "bin") {
+                    continue;
+                }
+            }
             let w = wide(line);
             if apps.iter().any(|a| a.1 == w) {
                 continue;
             }
-            let name = std::path::Path::new(line).file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let name = if is_dir {
+                p.file_name().unwrap_or_default().to_string_lossy().to_string()
+            } else {
+                p.file_stem().unwrap_or_default().to_string_lossy().to_string()
+            };
+            if name.is_empty() {
+                continue;
+            }
             apps.push((name, w));
             added = true;
+            count += 1;
         }
         drop(apps);
         if added {
@@ -584,6 +623,41 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 
 // ---------- geometry ----------
 
+/// Dynamic Quick Settings tile list matching actual hardware: hides Wi-Fi/Bluetooth/Airplane mode
+/// when those radios are absent and shows Ethernet on wired PCs.
+fn quick_tiles_for(has_wifi: bool, has_eth: bool, eth_up: bool, has_bt: bool, has_radios: bool, inet: bool) -> Vec<QTile> {
+    let mut v = Vec::with_capacity(7);
+    let show_eth = has_eth || (!has_wifi && inet);
+    if show_eth && (eth_up || !has_wifi) {
+        v.push(QTile::Ethernet);
+    }
+    if has_wifi {
+        v.push(QTile::Wifi);
+    }
+    if show_eth && has_wifi && !eth_up {
+        v.push(QTile::Ethernet);
+    }
+    if has_bt {
+        v.push(QTile::Bluetooth);
+    }
+    if has_wifi || has_bt || has_radios {
+        v.push(QTile::Airplane);
+    }
+    v.push(QTile::Accessibility);
+    v.push(QTile::EnergySaver);
+    v.push(QTile::LiveCaptions);
+    v
+}
+
+fn quick_tiles() -> Vec<QTile> {
+    quick_tiles_for(HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), crate::quick::has_bluetooth(), crate::quick::has_radios(), INET.get())
+}
+
+fn quick_card_top() -> i32 {
+    let rows = quick_tiles().len().div_ceil(3).max(1) as i32;
+    16 + 84 * rows
+}
+
 /// Extra vertical space inside Quick Settings when the audio output dropdown is expanded.
 fn audio_extra() -> i32 {
     if !AUDIO_OPEN.get() {
@@ -595,7 +669,7 @@ fn audio_extra() -> i32 {
 
 fn size(k: Kind) -> (i32, i32) {
     match k {
-        Kind::Quick => (360, 292 + 44 * sliders() + audio_extra()),
+        Kind::Quick => (360, quick_card_top() + 108 + 44 * sliders() + audio_extra()),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
@@ -661,16 +735,16 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
     let (w, h) = size(k);
     match k {
         Kind::Quick => {
-            // a 3x2 grid of tiles; the Wi-Fi tile has a round "more" button in its corner (found first: act_at searches backwards)
+            // dynamic 3-column grid of tiles; the Wi-Fi tile (when present) has a round "more" button in its corner
             let mut v = vec![];
-            for i in 0..6u8 {
+            for (i, tile) in quick_tiles().into_iter().enumerate() {
                 let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
-                v.push((r(tl, tt, tl + 104, tt + 76), Act::Tile(i)));
-                if i == 0 {
+                v.push((r(tl, tt, tl + 104, tt + 76), Act::Tile(tile)));
+                if tile == QTile::Wifi {
                     v.push((r(tl + 66, tt + 8, tl + 96, tt + 38), Act::WifiMore));
                 }
             }
-            let mut y = 188;
+            let mut y = quick_card_top() + 4;
             if BRIGHT.load(Relaxed) >= 0 {
                 v.push((r(64, y, w - 24, y + 40), Act::BrightSlide));
                 y += 44;
@@ -922,8 +996,11 @@ pub fn toggle(k: Kind) {
                 AUDIO_OPEN.set(false);
                 AUDIO_DEVS.set(crate::audio::outputs());
                 crate::reset_audio_endpoint();
+                crate::read_wifi();
                 read_brightness();
-                read_nets();
+                if HAS_WIFI.get() {
+                    read_nets();
+                }
                 crate::quick::refresh();
             }
             Kind::Start => {
@@ -935,7 +1012,7 @@ pub fn toggle(k: Kind) {
         let (w, h) = (sc(size(k).0), sc(size(k).1));
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let x = if vert() { side_x(w) } else { match k {
-            Kind::Start => (sw - w) / 2,
+            Kind::Start => if i18n::style::left_align() { bar_x_w().0 + sc(8) } else { (sw - w) / 2 },
             Kind::Menu => MENU_X.get().min(sw - w - sc(8)).max(sc(8)),
             _ => sw - w - sc(8),
         } };
@@ -1051,13 +1128,17 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         }
         Act::WifiMore => toggle(Kind::Wifi),
         Act::WifiSwitch => wifi_radio(WIFI.get() < 0 && NETS.with_borrow(|n| n.is_empty())),
-        Act::Tile(i) => match i {
-            0 => wifi_radio(WIFI.get() < 0),
-            5 => {
+        Act::Tile(tile) => match tile {
+            QTile::Ethernet => {
+                open(&wide("ms-settings:network-status"));
+                close();
+            }
+            QTile::Wifi => wifi_radio(WIFI.get() < 0),
+            QTile::LiveCaptions => {
                 close();
                 keys(&[VK_LWIN, VK_CONTROL, b'L' as u16]); // live captions
             }
-            1 => match crate::quick::bluetooth() {
+            QTile::Bluetooth => match crate::quick::bluetooth() {
                 Some(on) => crate::quick::set(false, !on),
                 None => {
                     // no answer from the radio list (still reading, or Windows hides it from us): do not sit silent, show Windows' page
@@ -1067,8 +1148,8 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                     close();
                 }
             },
-            2 => crate::quick::set(true, !crate::quick::airplane().unwrap_or(false)),
-            3 => {
+            QTile::Airplane => crate::quick::set(true, !crate::quick::airplane().unwrap_or(false)),
+            QTile::Accessibility => {
                 let mut pt: POINT = zeroed();
                 GetCursorPos(&mut pt);
                 let (nar, mag) = (crate::quick::running("Narrator.exe"), crate::quick::running("Magnify.exe"));
@@ -1086,7 +1167,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                     _ => crate::quick::set_keys(true, !filter),
                 });
             }
-            _ => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
+            QTile::EnergySaver => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
         },
         Act::Mute => toggle_mute(),
         Act::AudioDrop => {
@@ -1276,6 +1357,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
         Kind::Quick => {
             let rs = rects(k);
             let q = WIFI.get();
+            let eth_connected = ETH_UP.get() || (!HAS_WIFI.get() && INET.get());
             let ssid = NETS.with_borrow(|n| n.iter().find(|n| n.connected).map(|n| n.ssid.clone()));
             let wsub = match (q >= 0, ssid) {
                 (true, Some(s)) => s,
@@ -1283,42 +1365,58 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 _ if NETS.with_borrow(|n| n.is_empty()) => t!("Выключен", "Off").into(),
                 _ => t!("Не подключено", "Not connected").into(),
             };
+            let esub = if eth_connected && !INET.get() {
+                t!("Без интернета", "No internet").to_string()
+            } else if eth_connected {
+                crate::eth_speed_text(ETH_SPEED.get()).unwrap_or_else(|| t!("Подключено", "Connected").to_string())
+            } else {
+                t!("Не подключено", "Not connected").to_string()
+            };
             let (bt, air, acc, eco) = (crate::quick::bluetooth(), crate::quick::airplane(), crate::quick::accessibility_on(), crate::quick::energy_saver());
             let onoff = |b: Option<bool>| match b {
                 Some(true) => t!("Вкл.", "On").to_string(),
                 Some(false) => t!("Выкл.", "Off").to_string(),
                 None => t!("Нет", "None").to_string(),
             };
-            let states = [q >= 0, bt == Some(true), air == Some(true), acc, eco, false];
-            let tiles = [
-                ("\u{E701}", "Wi‑Fi".to_string(), wsub),
-                ("\u{E702}", "Bluetooth".to_string(), onoff(bt)),
-                ("\u{E709}", t!("Авиарежим", "Airplane mode").to_string(), onoff(air)),
-                ("\u{E776}", t!("Спец. возможности", "Accessibility").to_string(), onoff(Some(acc))),
-                ("\u{E945}", t!("Экономия энергии", "Energy saver").to_string(), onoff(Some(eco))),
-                ("\u{E7F0}", t!("Субтитры", "Live captions").to_string(), String::new()),
-            ];
-            for (i, (glyph, label, sub)) in tiles.iter().enumerate() {
+            let tiles = quick_tiles();
+            for (i, tile) in tiles.iter().copied().enumerate() {
                 let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
                 let full = r(tl, tt, tl + 104, tt + 76);
-                let on = states[i];
+                let (on, glyph, label, sub): (bool, &str, String, String) = match tile {
+                    QTile::Ethernet => (eth_connected, "\u{E839}", "Ethernet".into(), esub.clone()),
+                    QTile::Wifi => (q >= 0, "\u{E701}", "Wi‑Fi".into(), wsub.clone()),
+                    QTile::Bluetooth => (bt == Some(true), "\u{E702}", "Bluetooth".into(), onoff(bt)),
+                    QTile::Airplane => (air == Some(true), "\u{E709}", t!("Авиарежим", "Airplane mode").into(), onoff(air)),
+                    QTile::Accessibility => (acc, "\u{E776}", t!("Спец. возможности", "Accessibility").into(), onoff(Some(acc))),
+                    QTile::EnergySaver => (eco, "\u{E945}", t!("Экономия энергии", "Energy saver").into(), onoff(Some(eco))),
+                    QTile::LiveCaptions => (false, "\u{E7F0}", t!("Субтитры", "Live captions").into(), String::new()),
+                };
                 let base = if on { mix(card, pal().accent, 0.12) } else { card };
                 surface(dc, full, base, sc(18));
-                g(Act::Tile(i as u8), inset(full, 1), base, mix(base, pal().text, 0.05), sc(16));
+                g(Act::Tile(tile), inset(full, 1), base, mix(base, pal().text, 0.05), sc(16));
                 // the round icon badge: lit in the accent when on
                 let badge = r(tl + 12, tt + 12, tl + 44, tt + 44);
-                fill(dc, badge, if on { pal().accent } else { mix(card, pal().text, 0.08) }, sc(32));
+                let badge_bg = if on { pal().accent } else { mix(card, pal().text, 0.08) };
+                fill(dc, badge, badge_bg, sc(32));
                 let ink = if on { on_accent() } else { pal().text };
-                if i == 0 {
-                    // the same arcs as the bar: lit by the signal, a cross when not connected
-                    wifi_glyph(dc, (badge.left + badge.right) / 2, (badge.top + badge.bottom) / 2 - sc(1), sc(15), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, if on { pal().accent } else { card }, 0.55), if q < 0 { 1 } else { 0 });
-                    let more = rs.iter().find(|(_, a)| *a == Act::WifiMore).unwrap().0;
-                    g(Act::WifiMore, more, base, mix(base, pal().text, 0.1), sc(30));
-                    SelectObject(dc, f_gs);
-                    text(dc, "\u{E76C}", more, pal().dim, DT_CENTER);
-                } else {
-                    SelectObject(dc, f_glyph);
-                    text(dc, glyph, badge, ink, DT_CENTER);
+                match tile {
+                    QTile::Wifi => {
+                        // the same arcs as the bar: lit by the signal, a cross when not connected
+                        wifi_glyph(dc, (badge.left + badge.right) / 2, (badge.top + badge.bottom) / 2 - sc(1), sc(15), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, if on { pal().accent } else { card }, 0.55), if q < 0 { 1 } else { 0 });
+                        if let Some(&(more, _)) = rs.iter().find(|(_, a)| *a == Act::WifiMore) {
+                            g(Act::WifiMore, more, base, mix(base, pal().text, 0.1), sc(30));
+                            SelectObject(dc, f_gs);
+                            text(dc, "\u{E76C}", more, pal().dim, DT_CENTER);
+                        }
+                    }
+                    QTile::Ethernet => {
+                        let mark = if !eth_connected { 1 } else if !INET.get() { 2 } else { 0 };
+                        crate::eth_glyph(dc, (badge.left + badge.right) / 2, (badge.top + badge.bottom) / 2, sc(16), ink, badge_bg, mark);
+                    }
+                    _ => {
+                        SelectObject(dc, f_glyph);
+                        text(dc, glyph, badge, ink, DT_CENTER);
+                    }
                 }
                 SelectObject(dc, f_label);
                 text(dc, label.as_str(), r(tl + 12, tt + 46, tl + 102, tt + 62), pal().text, DT_LEFT);
@@ -1329,8 +1427,9 @@ unsafe fn paint(hw: HWND, k: Kind) {
             }
             // sliders and audio output dropdown sit together on one card
             let n = sliders();
-            surface(dc, r(16, 184, w - 16, 192 + 44 * n + 40 + audio_extra()), card, sc(18));
-            let mut y = 188;
+            let card_top = quick_card_top();
+            surface(dc, r(16, card_top, w - 16, card_top + 8 + 44 * n + 40 + audio_extra()), card, sc(18));
+            let mut y = card_top + 4;
             let b = BRIGHT.load(Relaxed);
             if b >= 0 {
                 SelectObject(dc, f_glyph);
@@ -1436,8 +1535,9 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     Link::Wifi(_) => None,
                     Link::NoInternet(_) => Some((t!("Подключено, но интернета нет", "Connected, no internet").to_string(), WARN)),
                     Link::Cable => Some((t!("Интернет по кабелю", "Online over a cable").into(), pal().dim)),
-                    Link::Offline if on => Some((t!("Не подключено", "Not connected").into(), pal().dim)),
-                    Link::Offline => Some((t!("Выключен", "Turned off").into(), pal().dim)),
+                    Link::CableNoInternet => Some((t!("Ethernet подключён, без интернета", "Ethernet connected, no internet").to_string(), WARN)),
+                    Link::Offline | Link::CableOffline if on => Some((t!("Не подключено", "Not connected").into(), pal().dim)),
+                    Link::Offline | Link::CableOffline => Some((t!("Выключен", "Turned off").into(), pal().dim)),
                 }
             };
             SelectObject(dc, f_title);
@@ -1664,7 +1764,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
             SelectObject(dc, f_txt);
             let q = QUERY.with_borrow(|q| q.clone());
             if q.is_empty() {
-                text(dc, "Type to search apps", r(64, 20, w - 64, 56), pal().dim, DT_LEFT);
+                text(dc, t!("Поиск приложений и файлов", "Type to search apps & files"), r(64, 20, w - 64, 56), pal().dim, DT_LEFT);
             } else {
                 text(dc, &q, r(64, 20, w - 64, 56), if SELALL.get() { pal().accent } else { pal().text }, DT_LEFT);
             }
@@ -1714,10 +1814,20 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         if !ic.is_null() {
                             DrawIconEx(dc, rc.left + sc(13), (rc.top + rc.bottom - icon_px()) / 2, ic, icon_px(), icon_px(), 0, null_mut(), DI_NORMAL); // at its loaded size: no stretching
                         }
-                        let store = wstr(&app.1).starts_with("shell:");
+                        let pstr = wstr(&app.1);
+                        let store = pstr.starts_with("shell:");
+                        let is_dir = !store && std::path::Path::new(&pstr).is_dir();
                         text(dc, &app.0, RECT { left: rc.left + sc(52), top: rc.top, right: rc.right - sc(110), bottom: rc.bottom }, pal().text, DT_LEFT);
                         SelectObject(dc, f_small);
-                        let kind = if sel && !q.is_empty() { "Enter ↵" } else if store { t!("Приложение", "App") } else { "" };
+                        let kind = if sel && !q.is_empty() {
+                            "Enter ↵"
+                        } else if store {
+                            t!("Приложение", "App")
+                        } else if is_dir {
+                            t!("Папка", "Folder")
+                        } else {
+                            ""
+                        };
                         text(dc, kind, RECT { left: rc.right - sc(110), top: rc.top, right: rc.right - sc(14), bottom: rc.bottom }, pal().dim, DT_RIGHT);
                         SelectObject(dc, f_txt);
                     }
@@ -1795,7 +1905,14 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             InvalidateRect(hw, null(), 0);
         }
         WM_TIMER => {
-            if k == Kind::Wifi && PASS.with_borrow(|p| p.is_none()) {
+            if k == Kind::Quick {
+                let mut cur: RECT = zeroed();
+                GetClientRect(hw, &mut cur);
+                let (w, h) = (sc(size(k).0), sc(size(k).1));
+                if cur.right != w || cur.bottom != h {
+                    resize_fly(k);
+                }
+            } else if k == Kind::Wifi && PASS.with_borrow(|p| p.is_none()) {
                 read_nets();
                 let (w, h) = (sc(size(k).0), sc(size(k).1));
                 // the panel hangs above the bar: keep its bottom edge where it is and grow / shrink upward
@@ -1937,7 +2054,31 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_layout, score};
+    use super::{QTile, flip_layout, quick_tiles_for, score};
+
+    #[test]
+    fn quick_tiles_match_hardware() {
+        // Ethernet-only desktop PC: no Wi-Fi, no Bluetooth, no Airplane mode
+        assert_eq!(
+            quick_tiles_for(false, true, true, false, false, true),
+            vec![QTile::Ethernet, QTile::Accessibility, QTile::EnergySaver, QTile::LiveCaptions]
+        );
+        // Desktop PC with Ethernet + Bluetooth, no Wi-Fi
+        assert_eq!(
+            quick_tiles_for(false, true, true, true, true, true),
+            vec![QTile::Ethernet, QTile::Bluetooth, QTile::Airplane, QTile::Accessibility, QTile::EnergySaver, QTile::LiveCaptions]
+        );
+        // Laptop with Wi-Fi + Bluetooth, no Ethernet
+        assert_eq!(
+            quick_tiles_for(true, false, false, true, true, true),
+            vec![QTile::Wifi, QTile::Bluetooth, QTile::Airplane, QTile::Accessibility, QTile::EnergySaver, QTile::LiveCaptions]
+        );
+        // Laptop with both Ethernet plugged in and Wi-Fi
+        let both = quick_tiles_for(true, true, true, true, true, true);
+        assert_eq!(both[0], QTile::Ethernet);
+        assert_eq!(both[1], QTile::Wifi);
+        assert_eq!(both[2], QTile::Bluetooth);
+    }
 
     #[test]
     fn layout_flip_both_ways() {

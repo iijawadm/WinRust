@@ -142,13 +142,111 @@ fn argb(c: Rgb) -> u32 {
     0xff00_0000 | (c.0 as u32) << 16 | (c.1 as u32) << 8 | c.2 as u32
 }
 
-/// Asks every drive's service, in drive order; a drive whose service is down or busy is skipped.
+/// Cross-drive ranking key matching `rs`'s ranking so exact matches on D:\ (e.g. D:\Games)
+/// are never buried behind 100 lower-relevance hits from C:\.
+fn rank_hit(path: &str, first_term: &str) -> (u8, u8, u8, usize) {
+    let l = path.to_lowercase();
+    let junk = ["\\winsxs\\", "\\windowsapps\\", "\\$recycle.bin\\", "\\servicing\\packages\\"].iter().any(|j| l.contains(j)) as u8;
+    let name = l.rsplit('\\').next().unwrap_or(&l);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let rank = if name == first_term || stem == first_term {
+        0
+    } else if name.starts_with(first_term) {
+        1
+    } else {
+        2
+    };
+    let tier = if l.ends_with(".lnk") {
+        if l.contains("\\start menu\\programs\\") { 0 } else { 1 }
+    } else if l.ends_with(".exe") && rank <= 1 {
+        2
+    } else if rank == 0 {
+        3
+    } else if l.ends_with(".exe") {
+        4
+    } else {
+        5
+    };
+    (junk, tier, rank, path.len())
+}
+
+/// Fast fallback scan of common user/drive locations when a drive has no running `rs --serve` pipe.
+fn fallback_scan(unindexed: &[char], terms: &[String]) -> Vec<String> {
+    if terms.is_empty() {
+        return vec![];
+    }
+    const SKIP: [&str; 7] = ["windows", "winsxs", "$recycle.bin", "system volume information", "node_modules", ".git", "appdata"];
+    let mut roots: Vec<(std::path::PathBuf, u8)> = Vec::new();
+    for &d in unindexed {
+        roots.push((std::path::PathBuf::from(format!("{d}:\\")), 2));
+    }
+    if unindexed.contains(&'C') {
+        if let Some(up) = std::env::var_os("USERPROFILE") {
+            let p = std::path::PathBuf::from(up);
+            for sub in ["Desktop", "Downloads", "Documents"] {
+                roots.push((p.join(sub), 2));
+            }
+            roots.push((p.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"), 3));
+        }
+        if let Some(pd) = std::env::var_os("ProgramData") {
+            roots.push((std::path::PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs"), 3));
+        }
+    }
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, u8)> = roots.into();
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    'walk: while let Some((dir, depth)) = queue.pop_front() {
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if out.len() >= 100 || t0.elapsed().as_millis() > 450 {
+                break 'walk;
+            }
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let path = e.path();
+            if terms.iter().all(|t| name.contains(t.as_str())) {
+                out.push(path.to_string_lossy().into_owned());
+            }
+            if depth > 0 && e.file_type().is_ok_and(|ft| ft.is_dir() && !ft.is_symlink()) && !SKIP.contains(&name.as_str()) {
+                queue.push_back((path, depth - 1));
+            }
+        }
+    }
+    out
+}
+
+/// Asks every drive's service, merges & re-ranks across all drives, and falls back to scanning
+/// unindexed fixed drives (e.g. exFAT / secondary game drives or when the service isn't running).
 fn ask(q: &str) -> Vec<String> {
-    common::drive_letters()
-        .into_iter()
-        .filter_map(|d| common::ask(d, q)?.ok())
-        .flat_map(|s| s.lines().filter(|l| !l.is_empty() && !l.starts_with("... ")).map(String::from).collect::<Vec<_>>())
-        .collect()
+    let terms: Vec<String> = q.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let first = terms.first().map(String::as_str).unwrap_or("");
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut unindexed = Vec::new();
+    for d in common::drive_letters() {
+        match common::ask(d, q) {
+            Some(Ok(s)) => {
+                for l in s.lines().filter(|l| !l.is_empty() && !l.starts_with("... ")) {
+                    if seen.insert(l.to_lowercase()) {
+                        out.push(l.to_string());
+                    }
+                }
+            }
+            _ => unindexed.push(d),
+        }
+    }
+    let fixed = common::fixed_drives();
+    unindexed.retain(|d| fixed.contains(d));
+    if !unindexed.is_empty() {
+        for p in fallback_scan(&unindexed, &terms) {
+            if seen.insert(p.to_lowercase()) {
+                out.push(p);
+            }
+        }
+    }
+    if !first.is_empty() {
+        out.sort_by(|a, b| rank_hit(a, first).cmp(&rank_hit(b, first)).then_with(|| a.cmp(b)));
+    }
+    out.truncate(100);
+    out
 }
 
 fn is_app(path: &str) -> bool {
@@ -1429,5 +1527,11 @@ mod tests {
         assert_eq!(size_text(512), "512 B");
         assert_eq!(size_text(1536), "1.5 KB");
         assert_eq!(size_text(5 * 1_048_576), "5.0 MB");
+    }
+
+    #[test]
+    fn cross_drive_ranking_surfaces_exact_games_folder() {
+        assert!(rank_hit(r"D:\Games", "games") < rank_hit(r"C:\Program Files\Helper\EpicGamesService.exe", "games"));
+        assert!(rank_hit(r"D:\Games", "games") < rank_hit(r"C:\Windows\WinSxS\amd64\games.exe", "games"));
     }
 }

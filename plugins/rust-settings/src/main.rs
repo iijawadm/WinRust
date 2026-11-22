@@ -98,6 +98,8 @@ enum Op {
     TimerBoost,
     RawMouse,
     NoStickyKey,
+    LeftAlign,
+    HideDeskIcons,
 }
 
 #[derive(Clone)]
@@ -205,14 +207,14 @@ fn gb(bytes: u64) -> String {
 const PAGE_KEYS: [&[&str]; 10] = [
     &["display"],
     &["sound"],
+    &["gaming", "game"],
     &["power", "battery", "storage"],
     &["network", "wifi", "ethernet"],
     &["bluetooth", "airplane"],
     &["apps"],
     &["update"],
-    &["personal", "color", "theme"],
+    &["personal", "color", "theme", "taskbar"],
     &["about"],
-    &["gaming", "game"],
 ];
 
 /// The page a name or an ms-settings: address points at; the first page when nothing matches.
@@ -431,11 +433,20 @@ fn sleep_text() -> String {
     power::timeout_text(power::Timeout::Sleep)
 }
 
-const NET_PAGE: usize = 3;
-const BT_PAGE: usize = 4;
-const APPS_PAGE: usize = 5;
-const WU_PAGE: usize = 6;
-const GAME_PAGE: usize = 9;
+const GAME_PAGE: usize = 2;
+const POWER_PAGE: usize = 3;
+const NET_PAGE: usize = 4;
+const BT_PAGE: usize = 5;
+const APPS_PAGE: usize = 6;
+const WU_PAGE: usize = 7;
+
+fn left_align_on() -> Option<bool> {
+    Some(winrust_common::style::left_align())
+}
+
+fn hide_desk_icons_on() -> Option<bool> {
+    Some(winrust_common::style::hide_desktop_icons())
+}
 
 fn auto_game_on() -> Option<bool> {
     Some(winrust_common::gaming::auto_game())
@@ -720,12 +731,12 @@ fn dynamic(page: usize, apps: &mut Option<Vec<ext::App>>) -> Option<Vec<Row>> {
     match page {
         0 => Some(display_rows()),
         1 => Some(sound_rows()),
-        2 => Some(power_rows()),
+        GAME_PAGE => Some(gaming_rows()),
+        POWER_PAGE => Some(power_rows()),
         NET_PAGE => Some(network_rows()),
         BT_PAGE => Some(bt_rows()),
         APPS_PAGE => Some(apps_rows(apps.get_or_insert_with(ext::programs))),
         WU_PAGE => Some(wu_rows()),
-        GAME_PAGE => Some(gaming_rows()),
         _ => None,
     }
 }
@@ -740,6 +751,7 @@ fn pages() -> Vec<Page> {
     vec![
         Page { title: t!("Экран", "Display").into(), rows: display_rows() },
         Page { title: t!("Звук", "Sound").into(), rows: sound_rows() },
+        Page { title: t!("Игры", "Gaming").into(), rows: gaming_rows() },
         Page { title: t!("Питание и диски", "Power & storage").into(), rows: power_rows() },
         Page { title: t!("Сеть", "Network").into(), rows: network_rows() },
         Page { title: "Bluetooth".into(), rows: bt_rows() },
@@ -753,6 +765,9 @@ fn pages() -> Vec<Page> {
                 toggle_row(t!("Тёмная тема для системы", "Dark theme for the system"), PERSONALIZE, "SystemUsesLightTheme", 0, 1),
                 toggle_row(t!("Эффекты прозрачности", "Transparency effects"), PERSONALIZE, "EnableTransparency", 1, 1),
                 toggle_row(t!("Акцентный цвет на заголовках окон", "Accent color on title bars"), r"Software\Microsoft\Windows\DWM", "ColorPrevalence", 1, 0),
+                head(t!("Панель задач и рабочий стол", "Taskbar & desktop")),
+                Row::Switch(t!("Значки панели задач слева", "Align taskbar icons to left").into(), left_align_on, Op::LeftAlign),
+                Row::Switch(t!("Скрыть значки рабочего стола", "Hide desktop icons").into(), hide_desk_icons_on, Op::HideDeskIcons),
             ],
         },
         Page {
@@ -767,7 +782,6 @@ fn pages() -> Vec<Page> {
                 Row::Info(t!("Сборка", "Build").into(), reg("CurrentBuild")),
             ],
         },
-        Page { title: t!("Игры", "Gaming").into(), rows: gaming_rows() },
     ]
 }
 
@@ -806,6 +820,7 @@ use winrust_common::style::rgb;
 const ICONS: [(&str, u32); 10] = [
     ("\u{E7F4}", rgb(10, 132, 255)),
     ("\u{E767}", rgb(255, 55, 95)),
+    ("\u{E7FC}", rgb(148, 82, 255)),
     ("\u{E7E8}", rgb(48, 209, 88)),
     ("\u{E774}", rgb(50, 173, 230)),
     ("\u{E702}", rgb(0, 122, 255)),
@@ -813,7 +828,6 @@ const ICONS: [(&str, u32); 10] = [
     ("\u{E895}", rgb(52, 199, 89)),
     ("\u{E771}", rgb(191, 90, 242)),
     ("\u{E946}", rgb(142, 142, 147)),
-    ("\u{E7FC}", rgb(148, 82, 255)),
 ];
 
 /// Fills `r`; `d` is the corner diameter (0 = square corners). Rounded shapes go through GDI+ for smooth edges;
@@ -1357,6 +1371,8 @@ unsafe fn display_or_mute(_hwnd: HWND, op: Op) {
         Op::TimerBoost => winrust_common::gaming::set_timer_boost(!winrust_common::gaming::timer_boost()),
         Op::RawMouse => set_raw_mouse(!raw_mouse_on().unwrap_or(false)),
         Op::NoStickyKey => set_sticky_hotkey_off(!sticky_hotkey_off().unwrap_or(false)),
+        Op::LeftAlign => winrust_common::style::set_left_align(!winrust_common::style::left_align()),
+        Op::HideDeskIcons => winrust_common::style::set_hide_desktop_icons(!winrust_common::style::hide_desktop_icons()),
         _ => {}
     }
 }
@@ -2145,7 +2161,7 @@ mod tests {
     #[test]
     fn every_page_has_its_keys() {
         assert_eq!(pages().len(), PAGE_KEYS.len());
-        assert_eq!(page_for("ms-settings:network-status"), 3);
+        assert_eq!(page_for("ms-settings:network-status"), NET_PAGE);
     }
 
     #[test]
@@ -2173,10 +2189,10 @@ mod tests {
         assert_eq!(os_name("Windows 10 Pro", 26100), "Windows 11 Pro");
         assert_eq!(os_name("Windows 10 Pro", 19045), "Windows 10 Pro");
         assert_eq!(gb(16 << 30), "16.0 GB");
-        assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (8, 0, 0, 0));
-        assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
+        assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (9, 0, 0, 0));
+        assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 8));
         assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
-        assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
+        assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (POWER_PAGE, POWER_PAGE));
         assert_eq!((page_for("gaming"), page_for("ms-settings:gaming-gamemode")), (GAME_PAGE, GAME_PAGE));
     }
 }

@@ -68,6 +68,7 @@ pub fn reload() {
     // WINRUST_STYLE overrides the file for this process only (to look at a style without switching every window)
     let name = std::env::var("WINRUST_STYLE").ok().or_else(|| file().and_then(|f| std::fs::read_to_string(f).ok()));
     store(Style::parse(&name.unwrap_or_default()));
+    reload_prefs();
 }
 
 /// The current style. The file is read again at most once a second, so a program that missed the broadcast still follows.
@@ -174,6 +175,77 @@ pub fn set_side(s: Side) {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(f, s.name());
     }
+}
+
+fn align_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("align.txt"))
+}
+
+fn desk_icons_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("desktop-icons.txt"))
+}
+
+static ALIGN: AtomicU8 = AtomicU8::new(0);
+static ALIGN_AT: AtomicU64 = AtomicU64::new(0);
+static DESK_HIDE_ICONS: AtomicU8 = AtomicU8::new(0);
+static DESK_HIDE_AT: AtomicU64 = AtomicU64::new(0);
+
+fn parse_left_align(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "left" | "1" | "true")
+}
+
+fn parse_flag(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "hide" | "hidden")
+}
+
+fn reload_prefs() {
+    let now = now_ms();
+    let la = align_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_left_align(&s));
+    ALIGN.store(la as u8, Relaxed);
+    ALIGN_AT.store(now, Relaxed);
+    let dh = desk_icons_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_flag(&s));
+    DESK_HIDE_ICONS.store(dh as u8, Relaxed);
+    DESK_HIDE_AT.store(now, Relaxed);
+}
+
+/// Align the taskbar's Start button and app icons to the left (false = centered, the default). Re-read once a second.
+pub fn left_align() -> bool {
+    if now_ms().saturating_sub(ALIGN_AT.load(Relaxed)) > 1000 {
+        let la = align_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_left_align(&s));
+        ALIGN.store(la as u8, Relaxed);
+        ALIGN_AT.store(now_ms(), Relaxed);
+    }
+    ALIGN.load(Relaxed) == 1
+}
+
+pub fn set_left_align(left: bool) {
+    ALIGN.store(left as u8, Relaxed);
+    ALIGN_AT.store(now_ms(), Relaxed);
+    if let Some(f) = align_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, if left { "left" } else { "center" });
+    }
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
+}
+
+/// Hide desktop icons (false = visible, the default). Re-read once a second and updated immediately via `msg()`.
+pub fn hide_desktop_icons() -> bool {
+    if now_ms().saturating_sub(DESK_HIDE_AT.load(Relaxed)) > 1000 {
+        let dh = desk_icons_file().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| parse_flag(&s));
+        DESK_HIDE_ICONS.store(dh as u8, Relaxed);
+        DESK_HIDE_AT.store(now_ms(), Relaxed);
+    }
+    DESK_HIDE_ICONS.load(Relaxed) == 1
+}
+
+pub fn set_hide_desktop_icons(hide: bool) {
+    DESK_HIDE_ICONS.store(hide as u8, Relaxed);
+    DESK_HIDE_AT.store(now_ms(), Relaxed);
+    if let Some(f) = desk_icons_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = std::fs::write(f, if hide { "1" } else { "0" });
+    }
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) };
 }
 
 /// The broadcast message a window gets when the style changed: call `reload()` and repaint.
@@ -372,10 +444,21 @@ mod tests {
 
     #[test]
     fn side_parses_and_defaults_to_bottom() {
-        assert_eq!(Side::parse(" Left
-"), Side::Left);
+        assert_eq!(Side::parse(" Left\n"), Side::Left);
         assert_eq!(Side::parse("right"), Side::Right);
         assert_eq!(Side::parse(""), Side::Bottom);
         assert_eq!(Side::parse("top"), Side::Bottom);
+    }
+
+    #[test]
+    fn align_and_desktop_icon_flags_parse() {
+        assert!(parse_left_align("left"));
+        assert!(parse_left_align(" LEFT\r\n"));
+        assert!(!parse_left_align("center"));
+        assert!(!parse_left_align(""));
+        assert!(parse_flag("1"));
+        assert!(parse_flag("hide"));
+        assert!(!parse_flag("0"));
+        assert!(!parse_flag(""));
     }
 }

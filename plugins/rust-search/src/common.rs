@@ -18,6 +18,17 @@ pub fn drive_letters() -> Vec<char> {
     (0..26).filter(|i| mask & (1 << i) != 0).map(|i| (b'A' + i as u8) as char).collect()
 }
 
+/// Letters of all fixed local drives (NTFS, exFAT, FAT32) without touching optical or network drives.
+pub fn fixed_drives() -> Vec<char> {
+    drive_letters()
+        .into_iter()
+        .filter(|d| {
+            let root: Vec<u16> = format!("{d}:\\").encode_utf16().chain([0]).collect();
+            unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED }
+        })
+        .collect()
+}
+
 /// Fixed (non-removable, non-network) drives formatted as NTFS: the ones the service can index.
 pub fn fixed_ntfs_drives() -> Vec<char> {
     drive_letters()

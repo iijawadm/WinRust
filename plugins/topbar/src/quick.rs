@@ -49,12 +49,22 @@ pub fn bluetooth() -> Option<bool> {
     }
 }
 
+/// True only when the PC actually has a Bluetooth radio adapter.
+pub fn has_bluetooth() -> bool {
+    BT.load(Relaxed) >= 0
+}
+
 pub fn airplane() -> Option<bool> {
     match AIR.load(Relaxed) {
         0 => Some(false),
         1 => Some(true),
         _ => None,
     }
+}
+
+/// True when the PC has at least one wireless radio (Wi-Fi, Bluetooth, cellular).
+pub fn has_radios() -> bool {
+    AIR.load(Relaxed) >= 0
 }
 
 /// Switches Bluetooth, or airplane mode (everything off; back from it Wi-Fi and Bluetooth come on).
