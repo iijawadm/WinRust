@@ -1422,7 +1422,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 text(dc, label.as_str(), r(tl + 12, tt + 46, tl + 102, tt + 62), pal().text, DT_LEFT);
                 if !sub.is_empty() {
                     SelectObject(dc, f_small);
-                    text(dc, sub, r(tl + 12, tt + 61, tl + 100, tt + 75), pal().dim, DT_LEFT);
+                    text(dc, &sub, r(tl + 12, tt + 61, tl + 100, tt + 75), pal().dim, DT_LEFT);
                 }
             }
             // sliders and audio output dropdown sit together on one card

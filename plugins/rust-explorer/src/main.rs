@@ -353,7 +353,7 @@ fn search(h: HWND, q: &str) {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut more = String::new();
     let mut indexed_drives = vec![];
-    let mut ask_all = |query: &str, rows: &mut Vec<Row>, seen: &mut std::collections::HashSet<String>, more: &mut String, drives: &mut Vec<char>| {
+    let ask_all = |query: &str, rows: &mut Vec<Row>, seen: &mut std::collections::HashSet<String>, more: &mut String, drives: &mut Vec<char>| {
         for d in 'A'..='Z' {
             let Some(reply) = ask(d, query) else { continue };
             if !drives.contains(&d) { drives.push(d); }
