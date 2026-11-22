@@ -137,7 +137,7 @@ static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook t
 const WIN_NUM: u32 = WM_APP + 15; // posted by the keyboard hook: Win+1..9 (wp 0..8) = the n-th button of the bar
 const NEXT_LANG: u32 = WM_APP + 16; // posted by the keyboard hook: Win+Space with no explorer (wp 1 = Shift held: previous layout)
 const VOLKEY: u32 = WM_APP + 14; // posted by the keyboard hook: a volume key (wp 0 up, 1 down, 2 mute)
-const GAME_LOCK: u32 = WM_APP + 15; // posted by the keyboard hook: Win+Shift+G toggles Win-key lock in games
+const GAME_LOCK: u32 = WM_APP + 17; // posted by the keyboard hook: Win+Shift+G toggles Win-key lock in games
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
@@ -591,7 +591,7 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         // Visual volume indicator bar (no numerical percentage): speaker icon + smooth rounded progress track.
         fill(dc, r, pal().line, sc(10));
         fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(10));
-        let fg = CreateFontW(-sc(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, wide(icon_face()).as_ptr());
+        let fg = CreateFontW(-sc(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, wide(i18n::style::icon_face()).as_ptr());
         let of = SelectObject(dc, fg);
         let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
         text(dc, vg, RECT { left: sc(8), top: 0, right: sc(30), bottom: r.bottom }, if muted { BAD } else { pal().text }, DT_CENTER);
@@ -2289,7 +2289,8 @@ unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
-    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), INET.get(), EXPLORER_UP.load(Relaxed), i18n::style::left_align(), has_overflow(), bar_idx().len(), clock_texts(), lang_name()).hash(&mut h);
+    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), INET.get(), EXPLORER_UP.load(Relaxed)).hash(&mut h);
+    (i18n::style::left_align(), has_overflow(), bar_idx().len(), clock_texts(), lang_name()).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
     h.finish()
 }

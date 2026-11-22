@@ -446,6 +446,7 @@ const BT_PAGE: usize = 5;
 const APPS_PAGE: usize = 6;
 const WU_PAGE: usize = 7;
 const RECOVERY_PAGE: usize = 9;
+#[cfg(test)]
 const ABOUT_PAGE: usize = 10;
 
 fn left_align_on() -> Option<bool> {
