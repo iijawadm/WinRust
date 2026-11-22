@@ -1,9 +1,11 @@
-//! The window: drawing (GDI+ shapes, GDI text), layout, dialogs and the message loop handler.
-use crate::*;
+//! The main WinRust window: DPI-aware double-buffered GDI+/GDI rendering, responsive landscape layout,
+//! confirmation & plugin settings dialogs, and message loop handler.
+use crate::{layout::*, *};
 
 // ---------- drawing ----------
 //
-// One back buffer per paint: GDI+ for the anti-aliased shapes, then GDI (ClearType) for text on top.
+// One back buffer per paint: GDI+ for anti-aliased shapes (creating a graphics context per shape so it obeys
+// the DC's IntersectClipRect clip region), and GDI (ClearType) for crisp text.
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -19,39 +21,45 @@ pub(crate) fn lerp(a: u32, b: u32, t: f32) -> u32 {
     m(0) | m(8) << 8 | m(16) << 16
 }
 
-pub(crate) type Box4 = [f32; 4]; // left, top, right, bottom in logical px
-
 pub(crate) struct Ui {
     dc: HDC,
-    g: *mut GpGraphics,
     s: f32,
 }
+
 impl Ui {
     fn px(&self, v: f32) -> i32 {
         (v * self.s).round() as i32
     }
     unsafe fn shape(&self, b: Box4, rad: f32, color: u32) {
+        let mut g = null_mut::<GpGraphics>();
+        if GdipCreateFromHDC(self.dc, &mut g) != 0 || g.is_null() {
+            return;
+        }
+        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
         let (s, mut path) = (self.s, null_mut::<GpPath>());
         let (x, y, w, h) = (b[0] * s, b[1] * s, (b[2] - b[0]) * s, (b[3] - b[1]) * s);
-        let d = (rad * 2.0 * s).min(h).min(w).max(0.01);
-        GdipCreatePath(FillModeAlternate, &mut path);
-        GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-        GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-        GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-        GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-        GdipClosePathFigure(path);
-        let mut br = null_mut::<GpSolidFill>();
-        GdipCreateSolidFill(color, &mut br);
-        GdipFillPath(self.g, br as *mut GpBrush, path);
-        GdipDeleteBrush(br as *mut GpBrush);
-        GdipDeletePath(path);
+        if w > 0.1 && h > 0.1 {
+            let d = (rad * 2.0 * s).min(h).min(w).max(0.01);
+            GdipCreatePath(FillModeAlternate, &mut path);
+            GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+            GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
+            GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
+            GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
+            GdipClosePathFigure(path);
+            let mut br = null_mut::<GpSolidFill>();
+            GdipCreateSolidFill(color, &mut br);
+            GdipFillPath(g, br as *mut GpBrush, path);
+            GdipDeleteBrush(br as *mut GpBrush);
+            GdipDeletePath(path);
+        }
+        GdipDeleteGraphics(g);
     }
     /// Rounded box with a 1 px outline (`line` == `fill` for none).
     unsafe fn round(&self, b: Box4, rad: f32, fill: u32, line: u32) {
         if line != fill {
             self.shape(b, rad, argb(line, 255));
             let i = 1.0 / self.s;
-            self.shape([b[0] + i, b[1] + i, b[2] - i, b[3] - i], rad - i, argb(fill, 255));
+            self.shape([b[0] + i, b[1] + i, b[2] - i, b[3] - i], (rad - i).max(0.0), argb(fill, 255));
         } else {
             self.shape(b, rad, argb(fill, 255));
         }
@@ -84,9 +92,6 @@ impl Ui {
     }
 }
 
-// layout, logical px
-pub(crate) const WIN_W: f32 = 600.0;
-pub(crate) const M: f32 = 24.0; // outer margin
 pub(crate) const N_READY: usize = {
     let (mut n, mut i) = (0, 0);
     while i < PLUGINS.len() {
@@ -97,16 +102,8 @@ pub(crate) const N_READY: usize = {
     }
     n
 };
-pub(crate) const LIST_TOP: f32 = 136.0;
-pub(crate) const ROW_H: f32 = 62.0;
-pub(crate) const LIST_H: f32 = N_READY as f32 * ROW_H + 12.0;
-pub(crate) const MAIN_TOP: f32 = LIST_TOP + LIST_H + 20.0;
-pub(crate) const MAIN_H: f32 = 54.0;
-pub(crate) const FOOT_H: f32 = 72.0;
-pub(crate) const WIN_H: f32 = MAIN_TOP + MAIN_H + 16.0 + FOOT_H;
-pub(crate) const BTN_W: f32 = 136.0;
-pub(crate) const BTN_H: f32 = 36.0;
-// clickable things
+
+// clickable element IDs
 pub(crate) const ID_MAIN: usize = 0;
 pub(crate) const ID_ROLLBACK: usize = 1;
 pub(crate) const ID_OK: usize = 2;
@@ -115,8 +112,11 @@ pub(crate) const ID_SWITCH: usize = 4;
 pub(crate) const ID_GEAR: usize = 5;
 pub(crate) const ID_LANG: usize = 6; // EN / RU switch
 pub(crate) const ID_SHELL: usize = 7; // settings panel: replace Explorer with rust-explorer
-pub(crate) const ID_CHECK: usize = 100; // + plugin index: the row's checkbox
+pub(crate) const ID_UNDO: usize = 8; // revert last recorded WinRust change
+pub(crate) const ID_RESTORE: usize = 9; // safely restore Windows defaults + verify shell
+pub(crate) const ID_CHECK: usize = 100; // + plugin index: card / checkbox toggle
 pub(crate) const STARTING: usize = usize::MAX - 1; // JOB before install_all picks its first component
+pub(crate) const JOB_RESTORE: usize = PLUGINS.len() + 1;
 
 /// Installable components, in install order (topbar comes before rust-explorer, which needs it).
 pub(crate) fn ready() -> impl Iterator<Item = usize> {
@@ -128,76 +128,39 @@ pub(crate) fn chosen() -> impl Iterator<Item = usize> {
     ready().filter(|&i| SELECTED[i].load(Relaxed))
 }
 
-/// Checkbox at the left end of row `k`, and the larger area that toggles it.
-pub(crate) fn check_box(k: usize, w: f32) -> (Box4, Box4) {
-    let r = row_box(k, w);
-    ([r[0] + 12.0, r[1] + 22.0, r[0] + 30.0, r[1] + 40.0], [r[0] + 4.0, r[1] + 8.0, r[0] + 38.0, r[3] - 8.0])
-}
-
-pub(crate) fn row_box(k: usize, w: f32) -> Box4 {
-    let t = LIST_TOP + 6.0 + k as f32 * ROW_H;
-    [M + 6.0, t, w - M - 6.0, t + ROW_H]
-}
-
-/// Settings gear at the right end of the row of the plugin that has settings (topbar): (plugin index, box).
-pub(crate) fn gear_box(w: f32) -> Option<(usize, Box4)> {
-    let (k, i) = ready().enumerate().find(|&(_, i)| PLUGINS[i].settings)?;
-    let r = row_box(k, w);
-    let t = r[1] + (ROW_H - 32.0) / 2.0;
-    Some((i, [r[2] - 14.0 - 32.0, t, r[2] - 14.0, t + 32.0]))
-}
-
-pub(crate) fn main_box(w: f32) -> Box4 {
-    [M, MAIN_TOP, w - M, MAIN_TOP + MAIN_H]
-}
-
-/// On/off switch inside the settings panel row.
-pub(crate) fn switch_box(w: f32) -> Box4 {
-    let (d, _, _) = dialog_boxes(w);
-    [d[2] - 24.0 - 16.0 - 44.0, d[1] + 78.0 + 23.0, d[2] - 24.0 - 16.0, d[1] + 78.0 + 47.0]
-}
-
-/// Second switch row of the settings panel: which shell to install.
-pub(crate) fn shell_switch_box(w: f32) -> Box4 {
-    let b = switch_box(w);
-    [b[0], b[1] + 80.0, b[2], b[3] + 80.0]
-}
-
 /// Index of rust-explorer in PLUGINS.
 fn explorer_idx() -> Option<usize> {
     PLUGINS.iter().position(|p| p.name == crate::selection::RUST_EXPLORER)
 }
 
-/// The EN / RU switch in the top right corner of the header.
-pub(crate) fn lang_box(w: f32) -> Box4 {
-    [w - M - 96.0, 18.0, w - M, 18.0 + 30.0]
+unsafe fn dpi_scale(hwnd: HWND) -> f32 {
+    let dc = GetDC(hwnd);
+    let s = (GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0).max(1.0);
+    ReleaseDC(hwnd, dc);
+    s
 }
 
-pub(crate) fn rollback_box(w: f32) -> Box4 {
-    let t = WIN_H - FOOT_H + (FOOT_H - BTN_H) / 2.0;
-    [w - M - 150.0, t, w - M, t + BTN_H]
-}
-
-/// Dialog panel and its (cancel, ok) buttons.
-pub(crate) fn dialog_boxes(w: f32) -> (Box4, Box4, Box4) {
-    let (dw, dh) = (528.0, 352.0);
-    let (l, t) = ((w - dw) / 2.0, (WIN_H - dh) / 2.0);
-    let (bt, r) = (t + dh - 24.0 - BTN_H, l + dw - 24.0);
-    ([l, t, l + dw, t + dh], [r - BTN_W - 10.0 - 120.0, bt, r - BTN_W - 10.0, bt + BTN_H], [r - BTN_W, bt, r, bt + BTN_H])
-}
-
-/// A button: `kind` 0 = primary (accent), 1 = secondary (outline), 2 = danger (outline, red text), 3 = disabled.
+/// Button styles: 0 = primary accent, 1 = secondary outline, 2 = danger outline, 3 = disabled, 4 = warning/restore outline.
 pub(crate) unsafe fn button(ui: &Ui, b: Box4, label: &str, kind: u8, hot: bool) {
     let (fill, line, fg) = match kind {
         0 => (ACCENT, ACCENT, rgb(255, 255, 255)),
         1 => (PANEL, BORDER, TEXT),
         2 => (PANEL, BORDER, BAD),
-        _ => (PANEL, lerp(PANEL, BORDER, 0.6), lerp(DIM, PANEL, 0.35)),
+        4 => (PANEL, lerp(BORDER, WARN_COL, 0.35), WARN_COL),
+        _ => (PANEL, lerp(PANEL, BORDER, 0.55), lerp(DIM, PANEL, 0.35)),
     };
-    let fill = if hot && kind != 3 { lerp(fill, TEXT, if kind == 0 { 0.14 } else { 0.07 }) } else { fill };
-    let line = if hot && kind == 2 { BAD } else if kind == 0 { fill } else { line };
+    let fill = if hot && kind != 3 { lerp(fill, TEXT, if kind == 0 { 0.14 } else { 0.08 }) } else { fill };
+    let line = if hot && kind == 2 {
+        BAD
+    } else if hot && kind == 4 {
+        WARN_COL
+    } else if kind == 0 {
+        fill
+    } else {
+        line
+    };
     ui.round(b, 8.0, fill, line);
-    ui.text(label, b, 13.5, 600, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    ui.text(label, b, 13.0, 600, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND) {
@@ -205,19 +168,19 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
-    let (cw, ch) = (rc.right, rc.bottom);
+    let (cw, ch) = (rc.right.max(1), rc.bottom.max(1));
     let mem = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, cw, ch);
     let ob = SelectObject(mem, bmp);
-    let s = GetDeviceCaps(hdc, LOGPIXELSX as i32) as f32 / 96.0;
+    let s = (GetDeviceCaps(hdc, LOGPIXELSX as i32) as f32 / 96.0).max(1.0);
     let bgb = CreateSolidBrush(BG);
     FillRect(mem, &rc, bgb);
     DeleteObject(bgb);
-    let mut g = null_mut::<GpGraphics>();
-    GdipCreateFromHDC(mem, &mut g);
-    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-    let ui = Ui { dc: mem, g, s };
-    let w = cw as f32 / s;
+    let ui = Ui { dc: mem, s };
+    let (w, h) = (cw as f32 / s, ch as f32 / s);
+    let lay = layout::compute(w, h, N_READY, SCROLL.get());
+    SCROLL.set(lay.scroll);
+
     let hover = HOVER.get();
     let dialog = DIALOG.with_borrow(|d| d.as_ref().map(|d| (d.title.clone(), d.text.clone(), d.ok.clone(), d.danger)));
     let hot = |id: usize| hover == Some(id);
@@ -225,49 +188,94 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
     let job = JOB.load(Relaxed);
     let n = PLUGINS.len();
     let n_inst = ready().filter(|&i| INSTALLED[i].load(Relaxed)).count();
-
-    // header: logo + name
-    ui.shape([0.0, 0.0, w, 3.0], 0.0, argb(ACCENT, 255));
-    let logo = [M, 30.0, M + 60.0, 90.0];
-    ui.round(logo, 16.0, ACCENT, ACCENT);
-    let inner = lerp(ACCENT, BG, 0.12);
-    ui.round([logo[0] + 4.0, logo[1] + 4.0, logo[2] - 4.0, logo[3] - 4.0], 13.0, inner, inner);
-    ui.text("W", [logo[0], logo[1] - 2.0, logo[2], logo[3]], 32.0, 900, rgb(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    let tx = logo[2] + 18.0;
-    ui.text("WinRust", [tx, 28.0, w - M, 64.0], 30.0, 700, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    ui.text(&tf!("Оболочка Windows на Rust  \u{00B7}  установлено {n_inst} из {N_READY}", "A Windows shell in Rust  \u{00B7}  {n_inst} of {N_READY} installed"), [tx, 64.0, w - M, 88.0], 13.0, 400, DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    ui.text(t!("ВХОДИТ В СОСТАВ", "INCLUDED"), [M + 4.0, LIST_TOP - 26.0, w - M, LIST_TOP - 6.0], 11.0, 700, DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    // component list
-    ui.round([M, LIST_TOP, w - M, LIST_TOP + LIST_H], 12.0, PANEL, BORDER);
-    let pos = chosen().position(|i| i == job); // where install_all is now
     let n_sel = chosen().count();
     let n_sel_inst = chosen().filter(|&i| INSTALLED[i].load(Relaxed)).count();
-    let gear = gear_box(w);
+    let can_undo = !busy && i18n::recovery::history_count() > 0;
+
+    // 1) Header: top accent line, compact badge, title & subtitle, language toggle
+    ui.shape([0.0, 0.0, w, 3.0], 0.0, argb(ACCENT, 255));
+    let logo = [M, 18.0, M + 44.0, 62.0];
+    ui.round(logo, 12.0, ACCENT, ACCENT);
+    let inner = lerp(ACCENT, BG, 0.14);
+    ui.round([logo[0] + 3.0, logo[1] + 3.0, logo[2] - 3.0, logo[3] - 3.0], 9.0, inner, inner);
+    ui.text("W", [logo[0], logo[1] - 1.0, logo[2], logo[3]], 24.0, 900, rgb(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    let tx = logo[2] + 14.0;
+    ui.text("WinRust", [tx, 15.0, lay.lang_box[0] - 12.0, 42.0], 22.0, 700, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    ui.text(
+        &tf!("Оболочка Windows на Rust  \u{00B7}  установлено {n_inst} из {N_READY}", "A Windows shell in Rust  \u{00B7}  {n_inst} of {N_READY} installed"),
+        [tx, 41.0, lay.lang_box[0] - 12.0, 62.0],
+        12.5,
+        400,
+        DIM,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+    button(&ui, lay.lang_box, if en!() { "Русский" } else { "English" }, 1, hot(ID_LANG));
+
+    // Section heading above the responsive card grid
+    ui.text(t!("КОМПОНЕНТЫ", "COMPONENTS"), [M + 2.0, HEADER_H, w * 0.5, LIST_TOP - 2.0], 11.0, 700, DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    ui.text(
+        &tf!("Выбрано: {n_sel} из {N_READY}", "Selected: {n_sel} of {N_READY}"),
+        [w * 0.5, HEADER_H, w - M - 2.0, LIST_TOP - 2.0],
+        11.5,
+        400,
+        DIM,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+    );
+
+    // 2) Responsive Component Grid (clipped strictly to lay.list_box so scrolled cards never bleed)
+    let well_bg = lerp(BG, PANEL, 0.35);
+    ui.round(lay.list_box, 12.0, well_bg, BORDER);
+
+    let saved = SaveDC(mem);
+    IntersectClipRect(
+        mem,
+        ui.px(lay.list_box[0] + 1.0),
+        ui.px(lay.list_box[1] + 1.0),
+        ui.px(lay.list_box[2] - 1.0),
+        ui.px(lay.list_box[3] - 1.0),
+    );
+
+    let pos = chosen().position(|i| i == job);
     for (k, i) in ready().enumerate() {
+        let Some(&card) = lay.cards.get(k) else { break };
+        if card[3] < lay.list_box[1] - 4.0 || card[1] > lay.list_box[3] + 4.0 {
+            continue;
+        }
         let p = &PLUGINS[i];
-        let r = row_box(k, w);
         let installed = INSTALLED[i].load(Relaxed);
         let working = busy && (job == i || (job == n && installed));
         let queued = busy && !installed && SELECTED[i].load(Relaxed) && (job == STARTING || ready().position(|j| j == job).is_some_and(|q| k > q));
-        if k > 0 {
-            ui.shape([r[0] + 12.0, r[1], r[2] - 12.0, r[1] + 1.0 / s], 0.0, argb(BORDER, 255));
-        }
-        if working {
-            let t = lerp(PANEL, ACCENT, 0.10);
-            ui.round([r[0], r[1] + 3.0, r[2], r[3] - 3.0], 9.0, t, t);
-        }
-        let (cb, _) = check_box(k, w);
         let sel = SELECTED[i].load(Relaxed);
-        ui.round(cb, 5.0, if sel { ACCENT } else { PANEL }, if sel { ACCENT } else { lerp(BORDER, TEXT, if hot(ID_CHECK + i) { 0.4 } else { 0.0 }) });
+        let card_hot = hot(ID_CHECK + i) && !busy;
+
+        let c_fill = if working {
+            lerp(PANEL, ACCENT, 0.14)
+        } else if card_hot {
+            lerp(PANEL, TEXT, 0.04)
+        } else {
+            PANEL
+        };
+        let c_line = if working {
+            ACCENT
+        } else if sel {
+            lerp(BORDER, ACCENT, 0.45)
+        } else {
+            BORDER
+        };
+        ui.round(card, 10.0, c_fill, c_line);
+
+        let (cb, _) = layout::card_check(card);
+        ui.round(cb, 5.0, if sel { ACCENT } else { BG }, if sel { ACCENT } else { lerp(BORDER, TEXT, if card_hot { 0.45 } else { 0.0 }) });
         if sel {
             ui.text_in("\u{E73E}", cb, 11.0, 700, rgb(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
         }
-        let tile = [r[0] + 42.0, r[1] + 13.0, r[0] + 78.0, r[1] + 49.0];
+
+        let mid = (card[1] + card[3]) / 2.0;
+        let tile = [card[0] + 40.0, mid - 17.0, card[0] + 74.0, mid + 17.0];
         let lit = installed || working;
-        let tint = if lit { lerp(PANEL, ACCENT, 0.20) } else { lerp(PANEL, TEXT, 0.06) };
-        ui.round(tile, 9.0, tint, tint);
-        ui.text_in(p.glyph, tile, 16.0, 400, if lit { ACCENT } else { TEXT }, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
+        let tint = if lit { lerp(PANEL, ACCENT, 0.22) } else { lerp(PANEL, TEXT, 0.06) };
+        ui.round(tile, 8.0, tint, tint);
+        ui.text_in(p.glyph, tile, 15.0, 400, if lit { ACCENT } else { TEXT }, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
 
         let (pill, pc) = if working {
             (if job == n { t!("Удаление…", "Removing…") } else { t!("Установка…", "Installing…") }, ACCENT)
@@ -278,138 +286,148 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
         } else {
             (t!("Не установлен", "Not installed"), DIM)
         };
-        let pr = r[2] - 14.0 - 32.0 - 10.0;
-        let pw = ui.width(pill, 11.5, 600) + 18.0;
-        let pb = [pr - pw, r[1] + 21.0, pr, r[1] + 41.0];
+        let gear_space = if p.settings { 38.0 } else { 0.0 };
+        let pr = card[2] - 10.0 - gear_space;
+        let pw = (ui.width(pill, 11.0, 600) + 14.0).min(110.0);
+        let pb = [pr - pw, card[1] + 10.0, pr, card[1] + 29.0];
         let ptint = lerp(PANEL, pc, 0.16);
-        ui.round(pb, 10.0, ptint, ptint);
-        ui.text(pill, pb, 11.5, 600, pc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        ui.round(pb, 9.0, ptint, ptint);
+        ui.text(pill, pb, 11.0, 600, pc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        let nx = tile[2] + 14.0;
-        ui.text(p.name, [nx, r[1] + 11.0, pb[0] - 10.0, r[1] + 32.0], 14.5, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        let nx = tile[2] + 12.0;
+        ui.text(p.name, [nx, card[1] + 9.0, pb[0] - 8.0, card[1] + 30.0], 14.0, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         let desc = p.desc.get();
         let short = desc.split(". ").next().unwrap_or(desc).trim_end_matches('.');
-        ui.text(short, [nx, r[1] + 32.0, pb[0] - 10.0, r[3] - 10.0], 12.0, 400, DIM, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        ui.text(short, [nx, card[1] + 31.0, pr, card[3] - 8.0], 11.5, 400, DIM, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
 
-        if let Some((_, gb)) = gear.filter(|&(gi, _)| gi == i) {
-            let h = hot(ID_GEAR) && !busy;
-            ui.round(gb, 8.0, if h { lerp(PANEL, TEXT, 0.08) } else { PANEL }, BORDER);
-            ui.text_in("\u{E713}", gb, 14.0, 400, if busy { DIM } else { TEXT }, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
+        if p.settings {
+            let gb = layout::card_gear(card);
+            let gh = hot(ID_GEAR) && !busy;
+            ui.round(gb, 7.0, if gh { lerp(PANEL, TEXT, 0.10) } else { BG }, BORDER);
+            ui.text_in("\u{E713}", gb, 13.5, 400, if busy { DIM } else { TEXT }, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
         }
     }
 
-    // the one button: installs everything that is missing (or updates all when nothing is)
-    let mb = main_box(w);
+    if let Some(sb) = lay.scrollbar {
+        ui.round(sb, 2.5, lerp(BORDER, TEXT, 0.22), lerp(BORDER, TEXT, 0.22));
+    }
+    RestoreDC(mem, saved);
+
+    // 3) Pinned Bottom Footer: Action Bar (Install + Undo + Restore Defaults + Remove All) + Status Strip
+    ui.shape([M, lay.footer_top, w - M, lay.footer_top + 1.0 / s], 0.0, argb(BORDER, 255));
+
+    let mb = lay.main_box;
     if busy {
         let base = lerp(PANEL, ACCENT, 0.22);
-        ui.round(mb, 12.0, base, base);
-        let done = if job == n { 0.0 } else { pos.map_or(0.0, |q| (q as f32 + 0.5) / n_sel as f32) };
+        ui.round(mb, 9.0, base, base);
+        let done = if job == n || job == JOB_RESTORE {
+            0.0
+        } else {
+            pos.map_or(0.0, |q| (q as f32 + 0.5) / n_sel.max(1) as f32)
+        };
         if done > 0.0 {
-            ui.shape([mb[0], mb[1], mb[0] + (mb[2] - mb[0]) * done, mb[3]], 12.0, argb(ACCENT, 255));
+            ui.shape([mb[0], mb[1], mb[0] + (mb[2] - mb[0]) * done, mb[3]], 9.0, argb(ACCENT, 255));
         }
         let label = if job == n {
             t!("Удаление WinRust…", "Removing WinRust…").to_string()
+        } else if job == JOB_RESTORE {
+            t!("Восстановление и проверка Windows…", "Restoring & verifying Windows…").to_string()
         } else {
-            pos.map_or(t!("Подготовка…", "Preparing…").into(), |q| tf!("Устанавливается {}  ({} из {})", "Installing {}  ({} of {})", PLUGINS[job].name, q + 1, n_sel))
+            pos.map_or(t!("Подготовка…", "Preparing…").into(), |q| tf!("Установка {} ({}/{})", "Installing {} ({}/{})", PLUGINS[job].name, q + 1, n_sel))
         };
-        ui.text(&label, mb, 15.5, 700, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        ui.text(&label, mb, 14.0, 700, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     } else {
         let all = n_sel_inst == n_sel && n_sel > 0;
         let label = if n_sel == 0 {
-            t!("Отметьте компоненты", "Tick the components").to_string()
+            t!("Выберите компоненты", "Select components").to_string()
         } else if n_sel < N_READY {
-            if all { tf!("Обновить выбранное  ({n_sel})", "Update selected  ({n_sel})") } else { tf!("Установить выбранное  ({n_sel})", "Install selected  ({n_sel})") }
+            if all { tf!("Обновить выбранное ({n_sel})", "Update selected ({n_sel})") } else { tf!("Установить выбранное ({n_sel})", "Install selected ({n_sel})") }
         } else if all {
             t!("Обновить WinRust", "Update WinRust").to_string()
         } else if n_inst == 0 {
             t!("Установить WinRust", "Install WinRust").into()
         } else {
-            tf!("Доустановить и обновить WinRust  (новых: {})", "Install and update WinRust  ({} new)", N_READY - n_inst)
+            tf!("Установить и обновить ({})", "Install & update ({} new)", N_READY - n_inst)
         };
         let (fill, fg) = if all || n_sel == 0 { (PANEL, if n_sel == 0 { DIM } else { TEXT }) } else { (ACCENT, rgb(255, 255, 255)) };
-        let fill = if hot(ID_MAIN) { lerp(fill, TEXT, if all { 0.07 } else { 0.14 }) } else { fill };
-        ui.round(mb, 12.0, fill, if all { BORDER } else { fill });
-        let tw = ui.width(&label, 16.0, 700);
-        let cx = (mb[0] + mb[2]) / 2.0 + 13.0;
-        ui.text_in(if all { "\u{E72C}" } else { "\u{E896}" }, [cx - tw / 2.0 - 30.0, mb[1], cx - tw / 2.0 - 6.0, mb[3]], 15.0, 400, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
-        ui.text(&label, [cx - tw / 2.0, mb[1], cx + tw / 2.0 + 4.0, mb[3]], 16.0, 700, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        let fill = if hot(ID_MAIN) && n_sel > 0 { lerp(fill, TEXT, if all { 0.08 } else { 0.14 }) } else { fill };
+        ui.round(mb, 9.0, fill, if all || n_sel == 0 { BORDER } else { fill });
+        let tw = ui.width(&label, 14.0, 700).min(mb[2] - mb[0] - 44.0);
+        let cx = (mb[0] + mb[2]) / 2.0 + 10.0;
+        ui.text_in(if all { "\u{E72C}" } else { "\u{E896}" }, [cx - tw / 2.0 - 26.0, mb[1], cx - tw / 2.0 - 4.0, mb[3]], 14.0, 400, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
+        ui.text(&label, [cx - tw / 2.0, mb[1], (cx + tw / 2.0 + 4.0).min(mb[2] - 8.0), mb[3]], 14.0, 700, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // footer: status on the left, remove-all on the right
-    let ft = WIN_H - FOOT_H;
-    ui.shape([M, ft, w - M, ft + 1.0 / s], 0.0, argb(BORDER, 255));
+    button(&ui, lay.undo_box, t!("Отменить", "Undo"), if can_undo { 1 } else { 3 }, hot(ID_UNDO));
+    button(&ui, lay.restore_box, t!("Восстановить", "Restore Defaults"), if !busy { 4 } else { 3 }, hot(ID_RESTORE));
+    button(&ui, lay.remove_box, t!("Удалить всё", "Remove All"), if n_inst > 0 && !busy { 2 } else { 3 }, hot(ID_ROLLBACK));
+
+    // Status strip
     let (m, ok) = MSG.lock().unwrap().clone();
     let (m, dot, fg) = if busy {
-        (t!("Выполняется, не закрывайте окно…", "Working, do not close the window…").to_string(), ACCENT, DIM)
+        (t!("Выполняется, не закрывайте окно…", "Working, please wait…").to_string(), ACCENT, DIM)
     } else if m.is_empty() {
-        (t!("Перед установкой создаётся точка восстановления.", "A restore point is created before installing.").into(), DIM, DIM)
+        (t!("Перед изменениями создаётся точка восстановления · Экстренное восстановление: winrust-recovery.exe", "A recovery point is saved automatically · Emergency recovery: winrust-recovery.exe").into(), DIM, DIM)
     } else if ok {
         (m, GOOD, TEXT)
     } else {
         (m, BAD, BAD)
     };
-    let rb = rollback_box(w);
-    ui.shape([M, ft + FOOT_H / 2.0 - 4.0, M + 8.0, ft + FOOT_H / 2.0 + 4.0], 4.0, argb(dot, 255));
-    let one_line = ui.width(&m, 12.5, 400) < rb[0] - 16.0 - M - 18.0;
-    let tb = [M + 18.0, ft + if one_line { 0.0 } else { 12.0 }, rb[0] - 16.0, WIN_H - if one_line { 0.0 } else { 8.0 }];
-    ui.text(&m, tb, 12.5, 400, fg, DT_LEFT | DT_END_ELLIPSIS | if one_line { DT_SINGLELINE | DT_VCENTER } else { DT_WORDBREAK });
-    button(&ui, rb, t!("Удалить всё", "Remove all"), if n_inst > 0 && !busy { 2 } else { 3 }, hot(ID_ROLLBACK));
-    // shows the language you would switch to; the other WinRust programs pick the choice up when they start
-    button(&ui, lang_box(w), if en!() { "Русский" } else { "English" }, 1, hot(ID_LANG));
+    ui.shape(lay.status_dot, 4.0, argb(dot, 255));
+    ui.text(&m, lay.status_box, 12.0, 400, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    // confirmation dialog over the dimmed window
+    // 4) Modal Confirmation Dialog (dynamically centered inside current window size)
     if let Some((title, text, ok_label, danger)) = dialog {
-        ui.shape([0.0, 0.0, w, WIN_H + 1.0], 0.0, argb(0, 160));
-        let (d, cancel, okb) = dialog_boxes(w);
+        ui.shape([0.0, 0.0, w, h + 1.0], 0.0, argb(0, 170));
+        let (d, cancel, okb) = layout::dialog_boxes(w, h);
         ui.round(d, 14.0, lerp(PANEL, BG, 0.25), BORDER);
         let accent = if danger { BAD } else { ACCENT };
-        let icon = [d[0] + 24.0, d[1] + 24.0, d[0] + 60.0, d[1] + 60.0];
+        let icon = [d[0] + 22.0, d[1] + 20.0, d[0] + 56.0, d[1] + 54.0];
         let tint = lerp(PANEL, accent, 0.18);
-        ui.round(icon, 18.0, tint, tint);
-        ui.text_in(if danger { "\u{E7BA}" } else { "\u{E946}" }, icon, 16.0, 400, accent, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
-        ui.text(&title, [icon[2] + 14.0, d[1] + 24.0, d[2] - 24.0, d[1] + 60.0], 17.0, 600, TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        ui.text(&text, [d[0] + 24.0, d[1] + 76.0, d[2] - 24.0, cancel[1] - 12.0], 12.5, 400, DIM, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        ui.round(icon, 17.0, tint, tint);
+        ui.text_in(if danger { "\u{E7BA}" } else { "\u{E946}" }, icon, 15.0, 400, accent, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
+        ui.text(&title, [icon[2] + 12.0, d[1] + 20.0, d[2] - 22.0, d[1] + 54.0], 16.5, 600, TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        ui.text(&text, [d[0] + 22.0, d[1] + 68.0, d[2] - 22.0, cancel[1] - 12.0], 12.5, 400, DIM, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
         button(&ui, cancel, t!("Отмена", "Cancel"), 1, hot(ID_CANCEL));
         let okfill = if hot(ID_OK) { lerp(accent, TEXT, 0.14) } else { accent };
         ui.round(okb, 8.0, okfill, okfill);
-        ui.text(&ok_label, okb, 13.5, 600, rgb(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        ui.text(&ok_label, okb, 13.0, 600, rgb(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    // settings panel of a plugin (topbar: OneDrive switch)
+    // 5) Plugin Settings Modal (topbar options)
     if let Some(i) = SETTINGS.get() {
-        ui.shape([0.0, 0.0, w, WIN_H + 1.0], 0.0, argb(0, 160));
-        let (d, _, closeb) = dialog_boxes(w);
+        ui.shape([0.0, 0.0, w, h + 1.0], 0.0, argb(0, 170));
+        let (d, _, closeb) = layout::dialog_boxes(w, h);
         ui.round(d, 14.0, lerp(PANEL, BG, 0.25), BORDER);
-        let icon = [d[0] + 24.0, d[1] + 24.0, d[0] + 60.0, d[1] + 60.0];
+        let icon = [d[0] + 22.0, d[1] + 20.0, d[0] + 56.0, d[1] + 54.0];
         let tint = lerp(PANEL, ACCENT, 0.18);
-        ui.round(icon, 18.0, tint, tint);
-        ui.text_in("\u{E713}", icon, 16.0, 400, ACCENT, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
-        ui.text(&tf!("Настройки {}", "{} settings", PLUGINS[i].name), [icon[2] + 14.0, d[1] + 24.0, d[2] - 24.0, d[1] + 60.0], 17.0, 600, TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        let row = [d[0] + 24.0, d[1] + 78.0, d[2] - 24.0, d[1] + 148.0];
-        let hid = od_hidden();
-        ui.round(row, 10.0, PANEL, BORDER);
-        ui.text(t!("Отключение OneDrive", "Disable OneDrive"), [row[0] + 16.0, row[1] + 10.0, row[2] - 80.0, row[1] + 32.0], 14.0, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        ui.text(t!("Значок OneDrive не показывается в топбаре (по умолчанию). Синхронизация продолжает работать.", "The OneDrive icon is not shown in the bar (default). Sync keeps working."), [row[0] + 16.0, row[1] + 32.0, row[2] - 80.0, row[3] - 6.0], 12.0, 400, DIM, DT_LEFT | DT_WORDBREAK);
-        let sw = switch_box(w);
+        ui.round(icon, 17.0, tint, tint);
+        ui.text_in("\u{E713}", icon, 15.0, 400, ACCENT, DT_CENTER | DT_VCENTER | DT_SINGLELINE, winrust_common::style::icon_face());
+        ui.text(&tf!("Настройки {}", "{} settings", PLUGINS[i].name), [icon[2] + 12.0, d[1] + 20.0, d[2] - 22.0, d[1] + 54.0], 16.5, 600, TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        let (row1, sw1, row2, sw2) = layout::settings_switches(w, h);
         let off = lerp(PANEL, TEXT, 0.25);
-        let track = if hid { ACCENT } else { off };
-        ui.round(sw, 12.0, track, track);
-        let kx = if hid { sw[2] - 12.0 } else { sw[0] + 12.0 };
-        ui.round([kx - 8.0, sw[1] + 4.0, kx + 8.0, sw[3] - 4.0], 8.0, TEXT, TEXT);
-        let row2 = [row[0], row[1] + 80.0, row[2], row[3] + 80.0];
+
+        let hid = od_hidden();
+        ui.round(row1, 10.0, PANEL, BORDER);
+        ui.text(t!("Отключение OneDrive", "Disable OneDrive"), [row1[0] + 14.0, row1[1] + 8.0, sw1[0] - 10.0, row1[1] + 30.0], 13.5, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        ui.text(t!("Значок OneDrive не показывается в панели (синхронизация работает).", "Hides the OneDrive tray icon (sync keeps working)."), [row1[0] + 14.0, row1[1] + 30.0, sw1[0] - 10.0, row1[3] - 6.0], 11.5, 400, DIM, DT_LEFT | DT_WORDBREAK);
+        let track1 = if hid { ACCENT } else { off };
+        ui.round(sw1, 12.0, track1, track1);
+        let kx1 = if hid { sw1[2] - 12.0 } else { sw1[0] + 12.0 };
+        ui.round([kx1 - 8.0, sw1[1] + 4.0, kx1 + 8.0, sw1[3] - 4.0], 8.0, TEXT, TEXT);
+
         let on = explorer_idx().is_some_and(|e| SELECTED[e].load(Relaxed));
         ui.round(row2, 10.0, PANEL, BORDER);
-        ui.text(t!("Оболочка: rust-explorer", "Shell: rust-explorer"), [row2[0] + 16.0, row2[1] + 10.0, row2[2] - 80.0, row2[1] + 32.0], 14.0, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        ui.text(t!("Включено: заменить Проводник. Выключено: остаётся стандартный Проводник Windows.", "On: replace Explorer. Off: the standard Windows Explorer stays."), [row2[0] + 16.0, row2[1] + 32.0, row2[2] - 80.0, row2[3] - 6.0], 12.0, 400, DIM, DT_LEFT | DT_WORDBREAK);
-        let sw2 = shell_switch_box(w);
+        ui.text(t!("Оболочка: rust-explorer", "Shell: rust-explorer"), [row2[0] + 14.0, row2[1] + 8.0, sw2[0] - 10.0, row2[1] + 30.0], 13.5, 600, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        ui.text(t!("Включено: установить rust-explorer для рабочего стола (Проводник Windows остаётся независимым).", "On: install rust-explorer desktop host (Windows File Explorer stays independent)."), [row2[0] + 14.0, row2[1] + 30.0, sw2[0] - 10.0, row2[3] - 6.0], 11.5, 400, DIM, DT_LEFT | DT_WORDBREAK);
         let track2 = if on { ACCENT } else { off };
         ui.round(sw2, 12.0, track2, track2);
         let kx2 = if on { sw2[2] - 12.0 } else { sw2[0] + 12.0 };
         ui.round([kx2 - 8.0, sw2[1] + 4.0, kx2 + 8.0, sw2[3] - 4.0], 8.0, TEXT, TEXT);
+
         button(&ui, closeb, t!("Закрыть", "Close"), 1, hot(ID_CANCEL));
     }
 
-    GdipDeleteGraphics(g);
     BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
     SelectObject(mem, ob);
     DeleteObject(bmp);
@@ -423,6 +441,7 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
 #[derive(Clone, Copy)]
 pub(crate) enum Act {
     InstallAll,
+    RestoreDefaults,
     Rollback,
 }
 pub(crate) struct Dialog {
@@ -434,42 +453,67 @@ pub(crate) struct Dialog {
 }
 thread_local! { pub(crate) static DIALOG: std::cell::RefCell<Option<Dialog>> = const { std::cell::RefCell::new(None) }; }
 
-/// Clickable thing under the cursor (ID_*). While a panel is up only its buttons count; while a job runs nothing does.
+/// Clickable element under the cursor (ID_*). While a modal is open only its controls are active; while busy none are.
 pub(crate) unsafe fn hit(hwnd: HWND, lp: isize) -> Option<usize> {
-    let (x, y) = ((lp & 0xFFFF) as i16 as f32, ((lp >> 16) & 0xFFFF) as i16 as f32);
-    let (mut rc, dc): (RECT, _) = (zeroed(), GetDC(hwnd));
-    let s = GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0;
-    ReleaseDC(hwnd, dc);
+    let s = dpi_scale(hwnd);
+    let (x, y) = (((lp & 0xFFFF) as i16) as f32 / s, (((lp >> 16) & 0xFFFF) as i16) as f32 / s);
+    let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
-    let w = rc.right as f32 / s;
-    let inside = |b: Box4| x >= b[0] * s && x <= b[2] * s && y >= b[1] * s && y <= b[3] * s;
+    let (w, h) = (rc.right as f32 / s, rc.bottom as f32 / s);
+    let inside = |b: Box4| layout::box_contains(b, x, y);
+
     if SETTINGS.get().is_some() {
-        let (_, _, closeb) = dialog_boxes(w);
-        return if inside(switch_box(w)) { Some(ID_SWITCH) } else if inside(shell_switch_box(w)) { Some(ID_SHELL) } else if inside(closeb) { Some(ID_CANCEL) } else { None };
+        let (_, _, closeb) = layout::dialog_boxes(w, h);
+        let (_, sw1, _, sw2) = layout::settings_switches(w, h);
+        return if inside(sw1) {
+            Some(ID_SWITCH)
+        } else if inside(sw2) {
+            Some(ID_SHELL)
+        } else if inside(closeb) {
+            Some(ID_CANCEL)
+        } else {
+            None
+        };
     }
     if DIALOG.with_borrow(|d| d.is_some()) {
-        let (_, cancel, ok) = dialog_boxes(w);
+        let (_, cancel, ok) = layout::dialog_boxes(w, h);
         return if inside(ok) { Some(ID_OK) } else if inside(cancel) { Some(ID_CANCEL) } else { None };
     }
     if BUSY.load(Relaxed) {
         return None;
     }
-    if gear_box(w).is_some_and(|(_, b)| inside(b)) {
-        return Some(ID_GEAR);
-    }
-    if let Some(i) = ready().enumerate().find_map(|(k, i)| inside(check_box(k, w).1).then_some(i)) {
-        return Some(ID_CHECK + i);
-    }
-    if inside(lang_box(w)) {
+
+    let lay = layout::compute(w, h, N_READY, SCROLL.get());
+    if inside(lay.lang_box) {
         return Some(ID_LANG);
     }
-    if inside(main_box(w)) {
+    if inside(lay.main_box) {
         return Some(ID_MAIN);
     }
-    (INSTALLED.iter().any(|f| f.load(Relaxed)) && inside(rollback_box(w))).then_some(ID_ROLLBACK)
+    if inside(lay.undo_box) && i18n::recovery::history_count() > 0 {
+        return Some(ID_UNDO);
+    }
+    if inside(lay.restore_box) {
+        return Some(ID_RESTORE);
+    }
+    if inside(lay.remove_box) && INSTALLED.iter().any(|f| f.load(Relaxed)) {
+        return Some(ID_ROLLBACK);
+    }
+    if inside(lay.list_box) {
+        for (k, i) in ready().enumerate() {
+            let Some(&card) = lay.cards.get(k) else { break };
+            if PLUGINS[i].settings && inside(layout::card_gear(card)) {
+                return Some(ID_GEAR);
+            }
+            if inside(card) {
+                return Some(ID_CHECK + i);
+            }
+        }
+    }
+    None
 }
 
-/// Runs `job` off the UI thread; its Ok/Err text becomes the status line. `which` = plugin index, n = rollback.
+/// Runs `job` off the UI thread; its Ok/Err text becomes the status line.
 pub(crate) fn start(hwnd: HWND, which: usize, job: impl FnOnce() -> Result<String, String> + Send + 'static) {
     JOB.store(which, Relaxed);
     BUSY.store(true, Relaxed);
@@ -487,21 +531,18 @@ pub(crate) fn start(hwnd: HWND, which: usize, job: impl FnOnce() -> Result<Strin
     });
 }
 
-/// One click: every component in order; missing ones are installed, installed ones updated from this installer.
-/// Only the ticked ones. A failed or skipped one does not stop the others (rust-explorer refuses by itself while topbar is
-/// missing); the failures are listed at the end. `h` = window to repaint between steps.
+/// One click: every ticked component in order; missing ones installed, installed ones updated from this installer.
 pub(crate) fn install_all(h: isize) -> Result<String, String> {
     let all = chosen().all(|i| (PLUGINS[i].installed)());
     let (mut done, mut failed, mut warned) = (Vec::new(), Vec::new(), false);
     for i in chosen() {
-        // installed ones are updated too: a newer installer must bring its fixes to them, not only add what is missing
         JOB.store(i, Relaxed);
         unsafe { InvalidateRect(h as HWND, null(), 0) };
         if let Err(e) = install_plugin(i) {
             failed.push(format!("{}: {e}", PLUGINS[i].name));
             continue;
         }
-        warned |= !WARN.lock().unwrap().is_empty(); // install_plugin clears the list for each component
+        warned |= !WARN.lock().unwrap().is_empty();
         done.push(PLUGINS[i].name);
         refresh();
     }
@@ -509,7 +550,7 @@ pub(crate) fn install_all(h: isize) -> Result<String, String> {
         let ok = if done.is_empty() { String::new() } else { tf!(" Готово: {}.", " Done: {}.", done.join(", ")) };
         return Err(format!("{}.{ok}", failed.join("; ")));
     }
-    let note = if warned { t!(" Есть предупреждения (см. %ProgramData%\\plugin-launcher\\install.log).", " There are warnings (see %ProgramData%\\plugin-launcher\\install.log).") } else { "" };
+    let note = if warned { t!(" Есть предупреждения (см. %ProgramData%\\plugin-launcher\\install.log).", " Warnings logged to %ProgramData%\\plugin-launcher\\install.log.") } else { "" };
     Ok(format!("WinRust {}: {}.{note}", if all { t!("обновлён", "updated") } else { t!("установлен", "installed") }, done.join(", ")))
 }
 
@@ -528,6 +569,10 @@ pub(crate) unsafe fn close_dialog(hwnd: HWND, run: bool) {
     }
     match d.act {
         Act::Rollback => start(hwnd, PLUGINS.len(), rollback),
+        Act::RestoreDefaults => start(hwnd, JOB_RESTORE, || {
+            init_soft();
+            i18n::recovery::restore_windows_defaults()
+        }),
         Act::InstallAll => {
             let h = hwnd as isize;
             start(hwnd, STARTING, move || install_all(h))
@@ -574,10 +619,30 @@ pub(crate) unsafe fn click(hwnd: HWND, id: usize) {
             HOVER.set(None);
             InvalidateRect(hwnd, null(), 0);
         }
+        ID_UNDO => {
+            *MSG.lock().unwrap() = match i18n::recovery::undo_last_change() {
+                Ok(m) => (m, true),
+                Err(e) => (e, false),
+            };
+            InvalidateRect(hwnd, null(), 0);
+        }
+        ID_RESTORE => ask(hwnd, Dialog {
+            title: t!("Восстановить настройки Windows?", "Restore Windows Defaults?").into(),
+            text: t!(
+                "Будет создана точка восстановления, затем безопасно остановлены компоненты оболочки WinRust, восстановлены Проводник Windows, панель задач, параметры Winlogon и исходная видимость значков рабочего стола, с проверкой запуска рабочего стола.\n\nЛичные файлы не затрагиваются.",
+                "A recovery point will be created first, then WinRust will safely stop its shell components, restore Windows File Explorer, the stock taskbar, Winlogon settings and your original desktop icon visibility, and verify that Explorer and the taskbar are active.\n\nNo personal files are touched."
+            ).into(),
+            ok: t!("Восстановить", "Restore Defaults").into(),
+            danger: false,
+            act: Act::RestoreDefaults,
+        }),
         ID_ROLLBACK => ask(hwnd, Dialog {
-            title: t!("Удалить WinRust?", "Remove WinRust?").into(),
-            text: t!("Все компоненты будут удалены. Вернутся поиск Windows, стандартный диспетчер задач, панель задач и обычный Проводник.", "All components will be removed. Windows Search, the stock Task Manager, the taskbar and regular Explorer come back.").into(),
-            ok: t!("Удалить всё", "Remove all").into(),
+            title: t!("Удалить WinRust полностью?", "Remove WinRust Completely?").into(),
+            text: t!(
+                "Все компоненты WinRust будут удалены. Вернутся поиск Windows, стандартный диспетчер задач, панель задач, Проводник Windows и исходная видимость значков рабочего стола (с проверкой запуска рабочего стола).\n\nЛичные файлы не затрагиваются.",
+                "All WinRust components will be removed. Windows Search, stock Task Manager, the taskbar, Windows File Explorer and your original desktop icon visibility will be restored and verified.\n\nNo personal files are touched."
+            ).into(),
+            ok: t!("Удалить всё", "Remove All").into(),
             danger: true,
             act: Act::Rollback,
         }),
@@ -589,22 +654,25 @@ pub(crate) unsafe fn click(hwnd: HWND, id: usize) {
             act: Act::InstallAll,
         }),
         ID_MAIN if chosen().count() < N_READY => {
-            let mut text = tf!("Будет установлено или обновлено: {}.\n\nКомпоненты меняют систему (подробности в описании каждого). Создаётся точка восстановления, «Удалить всё» вернёт систему.", "To be installed or updated: {}.\n\nThe components change the system (see each one's description). A restore point is created, 'Remove all' restores the system.", chosen().map(|i| PLUGINS[i].name).collect::<Vec<_>>().join(", "));
+            let mut text = tf!("Будет установлено или обновлено: {}.\n\nСоздаётся точка восстановления; «Восстановить» или «Удалить всё» безопасно вернут Windows.", "To be installed or updated: {}.\n\nA recovery point is created; 'Restore Defaults' or 'Remove All' safely reverts Windows.", chosen().map(|i| PLUGINS[i].name).collect::<Vec<_>>().join(", "));
             if let Some(i) = chosen().find(|&i| PLUGINS[i].name == RUST_EXPLORER && !INSTALLED[i].load(Relaxed)) {
                 text.push_str("\n\n");
                 text.push_str(PLUGINS[i].warn.get());
             }
             ask(hwnd, Dialog {
-                title: t!("Установить выбранное?", "Install the selected?").into(),
+                title: t!("Установить выбранное?", "Install Selected?").into(),
                 text,
                 ok: t!("Установить", "Install").into(),
                 danger: false,
                 act: Act::InstallAll,
             });
-        },
+        }
         ID_MAIN => ask(hwnd, Dialog {
             title: t!("Установить WinRust?", "Install WinRust?").into(),
-            text: t!("Компоненты Windows будут заменены:\n\u{2022} поиск Windows отключается, вместо него rust-search (Alt+Space);\n\u{2022} диспетчер задач заменяется на rtaskmgr;\n\u{2022} панель задач заменяется на topbar (внизу экрана);\n\u{2022} Проводник как оболочка отключается: папки и рабочий стол открывает rust-explorer, отключаются службы телеметрии.\n\nСоздаётся точка восстановления, «Удалить всё» вернёт систему. Если экран останется пустым: Ctrl+Alt+Del \u{2192} Диспетчер задач \u{2192} Запустить explorer.exe.", "Windows components will be replaced:\n\u{2022} Windows Search is disabled, rust-search (Alt+Space) takes its place;\n\u{2022} Task Manager is replaced by rtaskmgr;\n\u{2022} the taskbar is replaced by topbar (at the bottom of the screen);\n\u{2022} Explorer as the shell is disabled: rust-explorer opens folders and the desktop, telemetry services are disabled.\n\nA restore point is created, 'Remove all' restores the system. If the screen stays empty: Ctrl+Alt+Del \u{2192} Task Manager \u{2192} Run explorer.exe.").into(),
+            text: t!(
+                "Компоненты Windows будут обновлены:\n\u{2022} rust-search (Alt+Space) вместо Windows Search;\n\u{2022} rtaskmgr вместо Диспетчера задач;\n\u{2022} topbar вместо панели задач;\n\u{2022} rust-explorer для рабочего стола (Проводник Windows остаётся независимым по Win+E).\n\nСоздаётся точка восстановления и автономный инструмент winrust-recovery.exe.",
+                "Selected WinRust components will be installed:\n\u{2022} rust-search (Alt+Space) replacing Windows Search;\n\u{2022} rtaskmgr replacing Task Manager;\n\u{2022} topbar replacing the taskbar;\n\u{2022} rust-explorer desktop host (Windows File Explorer stays independent on Win+E).\n\nA recovery point and standalone winrust-recovery.exe are created automatically."
+            ).into(),
             ok: t!("Установить", "Install").into(),
             danger: false,
             act: Act::InstallAll,
@@ -615,6 +683,35 @@ pub(crate) unsafe fn click(hwnd: HWND, id: usize) {
 
 pub(crate) unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_GETMINMAXINFO => {
+            let s = dpi_scale(hwnd);
+            let mut r = RECT { left: 0, top: 0, right: (MIN_W * s).round() as i32, bottom: (MIN_H * s).round() as i32 };
+            AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, 0);
+            let mmi = &mut *(lp as *mut MINMAXINFO);
+            mmi.ptMinTrackSize.x = r.right - r.left;
+            mmi.ptMinTrackSize.y = r.bottom - r.top;
+            return 0;
+        }
+        WM_SIZE => {
+            let s = dpi_scale(hwnd);
+            let (w, h) = (((lp & 0xFFFF) as f32 / s).max(1.0), (((lp >> 16) & 0xFFFF) as f32 / s).max(1.0));
+            let lay = layout::compute(w, h, N_READY, SCROLL.get());
+            SCROLL.set(lay.scroll);
+            InvalidateRect(hwnd, null(), 0);
+        }
+        WM_MOUSEWHEEL => {
+            if SETTINGS.get().is_none() && DIALOG.with_borrow(|d| d.is_none()) {
+                let delta = ((wp >> 16) as i16) as f32;
+                let s = dpi_scale(hwnd);
+                let mut rc: RECT = zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let lay = layout::compute(rc.right as f32 / s, rc.bottom as f32 / s, N_READY, SCROLL.get() - (delta / 120.0) * 44.0);
+                if (lay.scroll - SCROLL.get()).abs() > 0.1 {
+                    SCROLL.set(lay.scroll);
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+        }
         WM_PAINT => paint(hwnd),
         WM_ERASEBKGND => return 1,
         WM_MOUSEMOVE => {
@@ -645,8 +742,7 @@ pub(crate) unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         }
         WM_KEYDOWN if DIALOG.with_borrow(|d| d.is_some()) => match wp as u16 {
             VK_ESCAPE => close_dialog(hwnd, false),
-            VK_RETURN if DIALOG.with_borrow(|d| d.as_ref().is_some_and(|d| !d.danger)) => close_dialog(hwnd, true), // a dangerous one needs the click
-
+            VK_RETURN if DIALOG.with_borrow(|d| d.as_ref().is_some_and(|d| !d.danger)) => close_dialog(hwnd, true),
             _ => {}
         },
         WM_DONE => {

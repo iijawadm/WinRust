@@ -190,10 +190,22 @@ pub(crate) fn rx_uninstall() -> Result<(), String> {
             soft(&tf!("привязка папок {k} не возвращена", "folder verbs {k} were not restored"), run("reg", &["import", &bak.display().to_string()]));
         }
     }
+    let had_topbar = !i18n::proc::pids("topbar.exe").is_empty();
+    let _ = i18n::recovery::stop_winrust_shell_and_wait();
     for n in ["rs-shell.exe", "rust-explorer.exe"] {
         let _ = run("taskkill", &["/f", "/im", n]);
     }
-    let _ = run("powershell", &["-NoProfile", "-Command", r#"if (-not (Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object { $_.CommandLine -match '(?i)explorer\.exe"?(\s+/NoUACCheck)?\s*$' })) { runas /trustlevel:0x20000 C:\Windows\explorer.exe }"#]);
+    // Start and verify Windows Explorer shell while no foreign Shell_TrayWnd or rs-desktop Progman exists.
+    soft(
+        t!("проверка оболочки Проводника Windows", "Windows Explorer shell verification"),
+        i18n::recovery::ensure_explorer_shell_verified().map(|_| ()),
+    );
+    // If only rust-explorer was uninstalled (topbar remains installed and was running), bring topbar back.
+    if had_topbar && bar_dir().join("topbar.exe").is_file() {
+        if run("schtasks", &["/run", "/tn", "topbar"]).is_err() {
+            let _ = Command::new("explorer.exe").arg(bar_dir().join("topbar.exe")).spawn();
+        }
+    }
     let _ = fs::remove_file(rx_lnk());
     let _ = fs::remove_file(start_lnk("Rust Explorer"));
     let _ = fs::remove_dir_all(rx_dir());

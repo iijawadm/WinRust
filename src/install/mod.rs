@@ -183,9 +183,17 @@ pub(crate) fn rollback() -> Result<String, String> {
     WARN.lock().unwrap().clear();
     init_soft();
     let _ = i18n::recovery::create_recovery_point("pre-rollback");
-    // reverse install order: rust-explorer (which switched Explorer off) goes before topbar, else the session is left with no panel and no shell
-    let errs: Vec<String> = PLUGINS.iter().rev().filter(|p| (p.installed)()).filter_map(|p| p.actions.and_then(|a| a.1().err().map(|e| format!("{}: {e}", p.name)))).collect();
-    let _ = i18n::recovery::restore_windows_defaults();
+    // Stop ALL WinRust shell processes (rs-shell, reshell, topbar, rust-explorer --desktop) FIRST and wait until
+    // foreign Shell_TrayWnd / Progman windows are gone so Windows Explorer can cleanly take back the shell.
+    soft(
+        t!("остановка оболочки WinRust", "stopping WinRust shell"),
+        i18n::recovery::stop_winrust_shell_and_wait(),
+    );
+    // reverse install order: rust-explorer (which switched Explorer off) goes before topbar
+    let mut errs: Vec<String> = PLUGINS.iter().rev().filter(|p| (p.installed)()).filter_map(|p| p.actions.and_then(|a| a.1().err().map(|e| format!("{}: {e}", p.name)))).collect();
+    if let Err(e) = i18n::recovery::restore_windows_defaults() {
+        errs.push(e);
+    }
     let _ = fs::remove_file(start_lnk("WinRust Recovery"));
     let rec = i18n::recovery::recovery_exe_path();
     if env::current_exe().ok().and_then(|p| p.canonicalize().ok()) != rec.canonicalize().ok() {
@@ -200,7 +208,7 @@ pub(crate) fn rollback() -> Result<String, String> {
         t!(" Есть предупреждения (см. %ProgramData%\\plugin-launcher\\install.log).", " See warnings in %ProgramData%\\plugin-launcher\\install.log.")
     };
     if errs.is_empty() {
-        Ok(tf!("Все плагины удалены.{note}", "All plugins removed.{note}"))
+        Ok(tf!("Все плагины удалены, Проводник и панель задач Windows проверены.{note}", "All plugins removed; Windows Explorer and taskbar verified.{note}"))
     } else {
         Err(format!("{}{note}", errs.join("; ")))
     }

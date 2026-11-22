@@ -24,16 +24,20 @@ If UAC asks for **another administrator's** password, the per-user settings (sta
 
 The installer is in English. The **Русский** button in its corner (or "WinRust apps in Русский" in the bar's right-click menu) switches every WinRust program to Russian.
 
-## Remove & Recovery
+## Remove & Emergency Recovery
 
-- **Recovery & Restore** in **WinRust Settings** (or the Start Menu **WinRust Recovery** shortcut / taskbar gear menu):
-  1. **Undo Last Changes** — reverts the most recent WinRust setting change.
-  2. **Restore Windows Defaults** — saves an automatic recovery point and safely restores Windows File Explorer associations, Winlogon shell/AutoRestartShell, stock taskbar, and your original pre-WinRust desktop icon visibility (never deletes personal files).
+- **From the main `WinRust.exe` window** (resizable landscape window): **Undo**, **Restore Defaults**, and **Remove All** are always pinned in the bottom action bar.
+- **From WinRust Settings → Recovery & Restore** (or Start Menu **WinRust Recovery** / taskbar gear menu):
+  1. **Undo Last Changes** — reverts the most recent recorded WinRust change.
+  2. **Restore Windows Defaults** — creates a pre-restore recovery point, safely stops WinRust's shell (`rs-shell`, `reshell`, elevated `topbar`, and `rust-explorer --desktop`) and waits until foreign `Shell_TrayWnd`/`Progman` windows exit, restores Windows File Explorer associations, `Winlogon` values, stock taskbar, and your original pre-WinRust desktop icon visibility, and **verifies** that Windows Explorer and the taskbar are active before reporting success (with automatic rollback if Explorer fails to start; never deletes personal files).
   3. **Full WinRust Uninstall** — completely removes all WinRust components, tasks, startup entries, and hooks after confirmation.
   4. **Create Recovery Point** — saves a timestamped snapshot of WinRust and Windows settings (plus a Windows System Restore point when elevated).
-- **Standalone recovery CLI** (works even if the UI has problems): `%ProgramFiles%\WinRust\winrust-recovery.exe restore-defaults --yes`, `winrust-recovery.exe rollback --yes`, or `rust-settings.exe --undo` / `--restore-defaults --yes` / `--uninstall-all --yes`.
+- **Independent Emergency Recovery (if the GUI crashes, freezes, or the screen is black):**
+  1. Press **Ctrl+Alt+Del** → **Task Manager** → **Run new task** (check *Create this task with administrative privileges*).
+  2. Run: `"%ProgramFiles%\WinRust\winrust-recovery.exe" emergency-restore --yes` (restores stock Windows Explorer & taskbar safely and verifies the desktop returns), **or** `winrust-recovery.exe rollback --yes` (full uninstall), **or** `winrust-recovery.exe verify-shell` (prints shell health).
+  3. Fallback if `winrust-recovery.exe` is unavailable: run `explorer.exe` in Task Manager, or run `"%ProgramFiles%\rust-settings\rust-settings.exe" --restore-defaults --yes`.
+  4. Audit log of every recovery step is saved to `%ProgramData%\WinRust\recovery\recovery.log`.
 - One plugin at a time: `plugin-launcher uninstall <plugin>` (see [Command line](#command-line)).
-- **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run `WinRust Recovery` or `winrust-recovery.exe rollback --yes`.
 
 On uninstall, `rust-explorer` restores the service startup values and the svchost grouping threshold saved before installation. Older installs without those backups keep their current values and report a warning.
 

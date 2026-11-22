@@ -16,19 +16,27 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
+    mem::{size_of, zeroed},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     ptr::{null, null_mut},
-    time::{SystemTime, UNIX_EPOCH},
+    thread::sleep,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM},
+    Foundation::{HWND, LPARAM, RECT},
     UI::{
-        Shell::{IsUserAnAdmin, SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, ShellExecuteW},
+        Shell::{
+            ABM_SETSTATE, ABS_ALWAYSONTOP, APPBARDATA, IsUserAnAdmin, SHAppBarMessage,
+            SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, ShellExecuteW,
+        },
         WindowsAndMessaging::{
-            EnumWindows, FindWindowExW, FindWindowW, GetShellWindow, SPI_SETMOUSE, SPIF_SENDCHANGE,
-            SPIF_UPDATEINIFILE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, ShowWindow, SystemParametersInfoW,
+            EnumWindows, FindWindowExW, FindWindowW, GetShellWindow, GetSystemMetrics,
+            GetWindowThreadProcessId, HWND_BROADCAST, IsWindowVisible, PostMessageW,
+            RegisterWindowMessageW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETMOUSE, SPI_SETWORKAREA,
+            SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL,
+            SendNotifyMessageW, ShowWindow, SystemParametersInfoW, WM_CLOSE,
         },
     },
 };
@@ -496,24 +504,414 @@ pub fn restore_explorer_associations() -> Result<String, String> {
     ))
 }
 
+fn rec_log(msg: &str) {
+    let dir = recovery_dir();
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("recovery.log")) {
+        let _ = writeln!(f, "[{}] {msg}", now_secs());
+    }
+}
+
+pub fn explorer_exe_path() -> PathBuf {
+    let win = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    win.join("explorer.exe")
+}
+
+fn hwnd_pid(h: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, &mut pid) };
+    pid
+}
+
+fn explorer_pids() -> Vec<u32> {
+    proc::pids("explorer.exe")
+}
+
 fn explorer_shell_running() -> bool {
     let h = unsafe { GetShellWindow() };
     if h.is_null() {
         return false;
     }
-    let mut pid = 0u32;
-    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, &mut pid) };
-    proc::list().iter().any(|(p, n)| *p == pid && n.eq_ignore_ascii_case("explorer.exe"))
+    let pid = hwnd_pid(h);
+    pid != 0 && explorer_pids().contains(&pid)
+}
+
+fn find_windows_by_class(class: &str) -> Vec<HWND> {
+    let cls = wide(class);
+    let mut out = Vec::new();
+    let mut cur = null_mut();
+    loop {
+        cur = unsafe { FindWindowExW(null_mut(), cur, cls.as_ptr(), null()) };
+        if cur.is_null() {
+            break;
+        }
+        out.push(cur);
+    }
+    out
+}
+
+fn explorer_tray_windows() -> Vec<HWND> {
+    let epids = explorer_pids();
+    let mut out = Vec::new();
+    for cls in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+        for h in find_windows_by_class(cls) {
+            if epids.contains(&hwnd_pid(h)) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// True when a non-Explorer process (e.g. topbar.exe) currently owns a `Shell_TrayWnd` window.
+/// While a foreign `Shell_TrayWnd` exists, Windows `explorer.exe` refuses to initialize as the desktop shell.
+fn has_foreign_shell_tray() -> bool {
+    let epids = explorer_pids();
+    find_windows_by_class("Shell_TrayWnd")
+        .into_iter()
+        .any(|h| !epids.contains(&hwnd_pid(h)))
+}
+
+fn has_rs_desktop() -> bool {
+    unsafe { !FindWindowW(wide("Progman").as_ptr(), wide("rs-desktop").as_ptr()).is_null() }
+}
+
+/// Live health report for the Windows Explorer desktop shell & taskbar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellStatus {
+    pub explorer_running: bool,
+    pub shell_window_ok: bool,
+    pub taskbar_visible: bool,
+    pub foreign_tray_present: bool,
+    pub rs_desktop_present: bool,
+}
+
+impl ShellStatus {
+    pub fn is_healthy(&self) -> bool {
+        self.explorer_running
+            && self.shell_window_ok
+            && self.taskbar_visible
+            && !self.foreign_tray_present
+            && !self.rs_desktop_present
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "explorer={}, shell_window={}, taskbar_visible={}, foreign_tray={}, rs_desktop={}",
+            self.explorer_running,
+            self.shell_window_ok,
+            self.taskbar_visible,
+            self.foreign_tray_present,
+            self.rs_desktop_present
+        )
+    }
+}
+
+pub fn verify_windows_shell() -> ShellStatus {
+    let epids = explorer_pids();
+    let shell_h = unsafe { GetShellWindow() };
+    let shell_window_ok = !shell_h.is_null() && epids.contains(&hwnd_pid(shell_h));
+    let trays = explorer_tray_windows();
+    let taskbar_visible = trays.iter().any(|&h| unsafe { IsWindowVisible(h) != 0 });
+    ShellStatus {
+        explorer_running: !epids.is_empty(),
+        shell_window_ok,
+        taskbar_visible,
+        foreign_tray_present: has_foreign_shell_tray(),
+        rs_desktop_present: has_rs_desktop(),
+    }
+}
+
+/// True when the current process is NOT elevated, yet restoring Windows defaults requires admin rights
+/// (e.g., `topbar.exe` runs elevated via its scheduled task and cannot be closed unelevated, or HKLM AutoRestartShell is 0).
+pub fn needs_elevation_for_restore() -> bool {
+    if unsafe { IsUserAnAdmin() != 0 } {
+        return false;
+    }
+    !proc::pids("topbar.exe").is_empty()
+        || has_foreign_shell_tray()
+        || reg_dword(HKLM_WINLOGON, "AutoRestartShell") == Some(0)
+}
+
+/// Launches the elevated recovery command (`winrust-recovery.exe restore-defaults --yes`, or fallback
+/// `rust-settings.exe --restore-defaults --yes`) when called from a standard-user UI process.
+pub fn launch_elevated_restore_defaults() -> Result<String, String> {
+    let _ = create_recovery_point("pre-restore");
+    let rec = recovery_exe_path();
+    let (exe, args) = if rec.is_file() {
+        (rec, "restore-defaults --yes")
+    } else if let Ok(cur) = std::env::current_exe() {
+        (cur, "--restore-defaults --yes")
+    } else {
+        return Err(t!("Не найден исполняемый файл восстановления.", "Recovery executable not found.").into());
+    };
+    let r = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            wide("runas").as_ptr(),
+            wide(&exe.display().to_string()).as_ptr(),
+            wide(args).as_ptr(),
+            null(),
+            SW_SHOWNORMAL,
+        ) as usize
+    };
+    if r > 32 {
+        Ok(t!(
+            "Запущено восстановление с правами администратора (подтвердите UAC).",
+            "Elevated Windows restore launched (confirm UAC)."
+        )
+        .into())
+    } else {
+        Err(t!(
+            "Не удалось запустить восстановление с правами администратора (UAC отменён).",
+            "Administrator confirmation (UAC) is required to stop elevated topbar and restore Windows Explorer."
+        )
+        .into())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct WinRustShellSnapshot {
+    had_topbar: bool,
+    had_desktop: bool,
+    had_reshell: bool,
+}
+
+fn capture_shell_snapshot() -> WinRustShellSnapshot {
+    WinRustShellSnapshot {
+        had_topbar: !proc::pids("topbar.exe").is_empty(),
+        had_desktop: has_rs_desktop(),
+        had_reshell: !proc::pids("reshell.exe").is_empty(),
+    }
+}
+
+fn wait_until(timeout_ms: u64, step_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let steps = (timeout_ms / step_ms.max(1)).max(1);
+    for _ in 0..steps {
+        if cond() {
+            return true;
+        }
+        sleep(Duration::from_millis(step_ms));
+    }
+    cond()
+}
+
+/// Stops WinRust shell processes (`rs-shell`, `reshell`, `topbar`, `rust-explorer --desktop`) in strict safe order
+/// and waits until all foreign `Shell_TrayWnd` and `rs-desktop` `Progman` windows are completely gone.
+pub fn stop_winrust_shell_and_wait() -> Result<(), String> {
+    // 1) Supervisors & keyboard hooks first so nothing respawns topbar or blocks keyboard input.
+    for name in ["rs-shell.exe", "reshell.exe"] {
+        for pid in proc::pids(name) {
+            proc::kill(pid);
+        }
+        let _ = Command::new("taskkill").args(["/f", "/im", name]).creation_flags(NO_WINDOW).status();
+    }
+
+    // 2) Ask topbar politely to close (its WM_DESTROY restores taskbar state & destroys its Shell_TrayWnd), then force if needed.
+    let tb_win = unsafe { FindWindowW(wide("topbar").as_ptr(), null()) };
+    if !tb_win.is_null() {
+        unsafe { PostMessageW(tb_win, WM_CLOSE, 0, 0) };
+    }
+    if !wait_until(1500, 100, || proc::pids("topbar.exe").is_empty() && !has_foreign_shell_tray()) {
+        for pid in proc::pids("topbar.exe") {
+            proc::kill(pid);
+        }
+        let _ = Command::new("taskkill").args(["/f", "/im", "topbar.exe"]).creation_flags(NO_WINDOW).status();
+    }
+
+    // 3) Close custom desktop host (only `--desktop` instances; keep normal folder windows untouched if any).
+    let desk_win = unsafe { FindWindowW(wide("Progman").as_ptr(), wide("rs-desktop").as_ptr()) };
+    if !desk_win.is_null() {
+        unsafe { PostMessageW(desk_win, WM_CLOSE, 0, 0) };
+    }
+    if !wait_until(1500, 100, || !has_rs_desktop()) {
+        for pid in proc::pids("rust-explorer.exe") {
+            if proc::cmdline(pid).is_some_and(|c| c.contains("--desktop")) {
+                proc::kill(pid);
+            }
+        }
+    }
+
+    // 4) Wait until all shell-conflicting windows are completely released before launching explorer.exe.
+    let clear = wait_until(4000, 100, || {
+        proc::pids("rs-shell.exe").is_empty()
+            && proc::pids("topbar.exe").is_empty()
+            && !has_foreign_shell_tray()
+            && !has_rs_desktop()
+    });
+    if !clear {
+        return Err(t!(
+            "Не удалось остановить topbar или рабочий стол WinRust (нужны права администратора).",
+            "Could not stop elevated topbar or WinRust desktop before starting Explorer (administrator rights required)."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Restores primary work area, unhides Explorer's stock taskbar(s) directly via Win32, restores saved auto-hide
+/// preference if present, and notifies tray applications (`TaskbarCreated`).
+pub fn unhide_explorer_taskbars() {
+    unsafe {
+        let mut wa = RECT {
+            left: 0,
+            top: 0,
+            right: GetSystemMetrics(SM_CXSCREEN),
+            bottom: GetSystemMetrics(SM_CYSCREEN),
+        };
+        SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut wa as *mut RECT as _, SPIF_SENDCHANGE);
+    }
+    let state_file = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("topbar-taskbar-state.txt"));
+    let saved_state = state_file
+        .as_ref()
+        .and_then(|f| fs::read_to_string(f).ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(ABS_ALWAYSONTOP as usize);
+
+    for tb in explorer_tray_windows() {
+        unsafe {
+            let mut ab: APPBARDATA = zeroed();
+            ab.cbSize = size_of::<APPBARDATA>() as u32;
+            ab.hWnd = tb;
+            ab.lParam = saved_state as isize;
+            SHAppBarMessage(ABM_SETSTATE, &mut ab);
+            ShowWindow(tb, SW_SHOW);
+        }
+    }
+    if let Some(f) = state_file {
+        let _ = fs::remove_file(f);
+    }
+    unsafe {
+        let msg = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
+        if msg != 0 {
+            SendNotifyMessageW(HWND_BROADCAST, msg, 0, 0);
+        }
+    }
+}
+
+fn start_explorer_via_limited_task(explorer: &Path) {
+    let ps = format!(
+        "$u=(Get-CimInstance Win32_ComputerSystem).UserName; \
+         if (-not $u) {{ $u=\"$env:USERDOMAIN\\$env:USERNAME\" }}; \
+         Register-ScheduledTask -TaskName WinRust-StartExplorer -Force \
+           -Action (New-ScheduledTaskAction -Execute '{}') \
+           -Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited) | Out-Null; \
+         Start-ScheduledTask -TaskName WinRust-StartExplorer; \
+         Start-Sleep -Milliseconds 1200; \
+         Unregister-ScheduledTask -TaskName WinRust-StartExplorer -Confirm:$false -ErrorAction SilentlyContinue",
+        explorer.display()
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(NO_WINDOW)
+        .status();
+}
+
+/// Ensures Windows `explorer.exe` is running as the desktop shell with a visible taskbar, using a multi-tier
+/// verified launch strategy. Never returns `Ok` until `verify_windows_shell().is_healthy()` is true.
+pub fn ensure_explorer_shell_verified() -> Result<ShellStatus, String> {
+    let explorer = explorer_exe_path();
+    if !explorer.is_file() {
+        return Err(tf!(
+            "Не найден системный файл Проводника: {}",
+            "Windows Explorer executable not found: {}",
+            explorer.display()
+        ));
+    }
+
+    if !explorer_shell_running() {
+        let elevated = unsafe { IsUserAnAdmin() != 0 };
+        let exp_str = explorer.display().to_string();
+        if !elevated {
+            rec_log("Tier 1: launching explorer.exe directly (unelevated)");
+            let _ = Command::new(&explorer).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+            wait_until(6000, 150, || explorer_shell_running() && !explorer_tray_windows().is_empty());
+        } else {
+            rec_log("Tier 2: launching explorer.exe via runas /trustlevel:0x20000");
+            let _ = Command::new("runas.exe")
+                .args(["/trustlevel:0x20000", &exp_str])
+                .creation_flags(NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if !wait_until(6000, 150, || explorer_shell_running() && !explorer_tray_windows().is_empty()) {
+                rec_log("Tier 3: runas did not initialize shell, trying limited interactive task");
+                start_explorer_via_limited_task(&explorer);
+                wait_until(6000, 150, || explorer_shell_running() && !explorer_tray_windows().is_empty());
+            }
+            if !explorer_shell_running() {
+                rec_log("Tier 4: last-resort direct explorer.exe spawn");
+                let _ = Command::new(&explorer).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                wait_until(5000, 150, || explorer_shell_running() && !explorer_tray_windows().is_empty());
+            }
+        }
+    }
+
+    unhide_explorer_taskbars();
+    wait_until(2500, 150, || verify_windows_shell().is_healthy());
+    let status = verify_windows_shell();
+    rec_log(&format!("Post-restore shell verification: {}", status.summary()));
+    if status.is_healthy() {
+        Ok(status)
+    } else {
+        Err(tf!(
+            "Проверка оболочки Windows не пройдена ({}). Попробуйте перезагрузить компьютер или запустить explorer.exe в Диспетчере задач.",
+            "Windows shell verification failed ({}). Try rebooting or running explorer.exe from Task Manager.",
+            status.summary()
+        ))
+    }
+}
+
+/// Emergency automatic rollback if Explorer failed to start: brings WinRust's shell back so the user is never left on a black screen.
+fn rollback_to_winrust_shell(snap: WinRustShellSnapshot) {
+    let pf = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    if snap.had_topbar {
+        let tb = pf.join(r"topbar\topbar.exe");
+        if tb.is_file() {
+            let _ = Command::new(&tb).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        }
+    }
+    if snap.had_desktop {
+        let rx = pf.join(r"rust-explorer\rust-explorer.exe");
+        if rx.is_file() {
+            let _ = Command::new(&rx).arg("--desktop").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        }
+    }
+    if snap.had_reshell {
+        let rs = pf.join(r"topbar\reshell.exe");
+        if rs.is_file() {
+            let _ = Command::new(&rs).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        }
+    }
 }
 
 /// Restores Windows shell, File Explorer, taskbar, desktop icons (from baseline), and resets WinRust overrides.
-/// Does NOT delete personal files or uninstall WinRust binaries.
+/// Never reports success unless Windows Explorer and the taskbar are verified running; automatically rolls back
+/// to WinRust's shell if Explorer cannot initialize so a black screen cannot occur. Never deletes personal files.
 pub fn restore_windows_defaults() -> Result<String, String> {
+    rec_log("restore_windows_defaults: start");
+    if !explorer_exe_path().is_file() {
+        return Err(t!(
+            "Отмена восстановления: C:\\Windows\\explorer.exe не найден.",
+            "Restore aborted: Windows explorer.exe was not found."
+        )
+        .into());
+    }
+    if needs_elevation_for_restore() {
+        return launch_elevated_restore_defaults();
+    }
+
+    let snap = capture_shell_snapshot();
     let _ = create_recovery_point("pre-restore");
     let _ = restore_explorer_associations();
     let base = read_baseline();
 
-    // Restore HKCU Winlogon\Shell if WinRust modified it.
+    // 1) Restore shell/Winlogon registry keys BEFORE stopping WinRust shell.
     if let Some(cur_shell) = reg_str(HKCU_WINLOGON, "Shell") {
         if cur_shell.to_lowercase().contains("rs-shell") {
             if let Some(orig) = base.get("hkcu_winlogon_shell").filter(|s| !s.is_empty()) {
@@ -523,13 +921,20 @@ pub fn restore_windows_defaults() -> Result<String, String> {
             }
         }
     }
-    // Turn off rs-shell's ReplaceExplorer switch.
     let _ = reg_ok(&["delete", r"HKCU\Software\rs-shell", "/f"]);
-    // Restore AutoRestartShell (requires admin; succeeds if elevated, harmless otherwise).
     let orig_restart = base.get("auto_restart_shell").map(String::as_str).unwrap_or("1");
     let _ = reg_ok(&["add", HKLM_WINLOGON, "/v", "AutoRestartShell", "/t", "REG_DWORD", "/d", orig_restart, "/f"]);
 
-    // Restore gaming/accessibility Windows registry values only if baseline captured original values.
+    // Disable WinRust shell autostart entries so Windows stays on stock Explorer after a reboot.
+    for tn in ["rs-overlay", "topbar", "reshell"] {
+        let _ = Command::new("schtasks").args(["/change", "/tn", tn, "/disable"]).creation_flags(NO_WINDOW).status();
+    }
+    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    for val in ["rs-overlay", "topbar", "reshell"] {
+        let _ = reg_ok(&["delete", run_key, "/v", val, "/f"]);
+    }
+
+    // Restore Windows gaming/accessibility registry keys only when captured in baseline.
     if let Some(v) = base.get("win_game_mode") {
         let _ = reg_ok(&["add", r"HKCU\Software\Microsoft\GameBar", "/v", "AutoGameModeEnabled", "/t", "REG_DWORD", "/d", v, "/f"]);
     }
@@ -544,45 +949,37 @@ pub fn restore_windows_defaults() -> Result<String, String> {
         apply_sticky_flags(v);
     }
 
-    // Restore stock Windows taskbar if topbar hid it.
-    let pf = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    let topbar = pf.join(r"topbar\topbar.exe");
-    if topbar.is_file() {
-        let _ = Command::new(&topbar).arg("--restore").creation_flags(NO_WINDOW).status();
+    // 2) Stop ALL WinRust shell components (rs-shell, reshell, topbar, rust-explorer --desktop) and wait until
+    //    their Shell_TrayWnd and Progman windows are completely gone so explorer.exe can become the real shell.
+    if let Err(e) = stop_winrust_shell_and_wait() {
+        rec_log(&format!("stop_winrust_shell_and_wait failed: {e}"));
+        rollback_to_winrust_shell(snap);
+        return Err(e);
     }
 
-    // Stop shell replacement overlay & custom desktop so Windows Explorer shell can take back control cleanly.
-    for p in proc::pids("rs-shell.exe") {
-        proc::kill(p);
-    }
-    for p in proc::pids("rust-explorer.exe") {
-        if proc::cmdline(p).is_some_and(|c| c.contains("--desktop")) {
-            proc::kill(p);
-        }
-    }
-
-    // Reset WinRust style & gaming settings cleanly.
+    // 3) Reset WinRust UI & gaming switches cleanly.
     style::reset_all();
     gaming::set_auto_game(false);
     gaming::set_win_lock(false);
     gaming::set_timer_boost(false);
 
-    // Ensure Windows Explorer shell is running (unelevated via runas /trustlevel:0x20000).
-    if !explorer_shell_running() {
-        let _ = Command::new("runas.exe")
-            .args(["/trustlevel:0x20000", r"C:\Windows\explorer.exe"])
-            .creation_flags(NO_WINDOW)
-            .spawn();
+    // 4) Start Windows Explorer safely and VERIFY shell + visible taskbar before declaring success.
+    if let Err(e) = ensure_explorer_shell_verified() {
+        rec_log(&format!("Explorer verification failed, rolling back WinRust shell: {e}"));
+        rollback_to_winrust_shell(snap);
+        return Err(tf!(
+            "{e} Оболочка WinRust временно возвращена, чтобы избежать чёрного экрана.",
+            "{e} WinRust shell was temporarily restored to prevent a black screen."
+        ));
     }
 
-    // Restore original desktop icon visibility from baseline (preserving pre-WinRust setting).
+    // 5) Restore user's original pre-WinRust desktop icon visibility now that Explorer desktop is live.
     restore_original_desktop_icons();
+    rec_log("restore_windows_defaults: verified OK");
 
     Ok(t!(
-        "Настройки Windows по умолчанию восстановлены (личные файлы не затронуты).",
-        "Windows defaults restored (no personal files were touched)."
+        "Настройки Windows восстановлены и проверены: Проводник и панель задач работают (личные файлы не затронуты).",
+        "Windows defaults restored and verified: Explorer and taskbar are active (no personal files were touched)."
     )
     .into())
 }
@@ -629,9 +1026,10 @@ pub fn launch_full_uninstall() -> Result<String, String> {
 /// Fallback full uninstall executed when `rust-settings.exe --uninstall-all --yes` runs elevated
 /// (if `winrust-recovery.exe` was not present). Never touches user personal files.
 pub fn uninstall_all_in_process() -> Result<String, String> {
-    let _ = restore_windows_defaults();
+    rec_log("uninstall_all_in_process: start");
+    let restore_res = restore_windows_defaults();
 
-    // Stop WinRust background & shell processes.
+    // Stop remaining WinRust background processes (shell processes were already cleanly stopped above).
     for name in [
         "rs-shell.exe",
         "rust-explorer.exe",
@@ -649,7 +1047,7 @@ pub fn uninstall_all_in_process() -> Result<String, String> {
     }
 
     // Remove scheduled tasks created by WinRust.
-    for tn in ["rs-overlay", "topbar", "rust-search", "rs-launcher", "WinRustSearch"] {
+    for tn in ["rs-overlay", "topbar", "reshell", "rust-search", "rs-launcher", "WinRustSearch"] {
         let _ = Command::new("schtasks").args(["/delete", "/tn", tn, "/f"]).creation_flags(NO_WINDOW).status();
     }
 
@@ -696,12 +1094,21 @@ pub fn uninstall_all_in_process() -> Result<String, String> {
         let _ = fs::remove_dir_all(pf.join(dir));
     }
 
+    // Ensure Windows Explorer shell is verified alive after removing plugin directories.
+    let shell_ok = ensure_explorer_shell_verified();
     // Restore original desktop icons one final time after Explorer is active.
     restore_original_desktop_icons();
 
+    if let Err(e) = shell_ok {
+        return Err(e);
+    }
+    if let Err(e) = restore_res {
+        rec_log(&format!("uninstall_all_in_process initial restore note: {e}"));
+    }
+
     Ok(t!(
-        "Компоненты WinRust удалены и настройки Windows восстановлены.",
-        "WinRust components removed and Windows settings restored."
+        "Компоненты WinRust удалены, Проводник и панель задач Windows проверены.",
+        "WinRust components removed; Windows Explorer and taskbar verified."
     )
     .into())
 }
@@ -753,5 +1160,22 @@ mod tests {
         let back = parse_kv(&fs::read_to_string(&f).unwrap());
         assert_eq!(back.get("style").map(String::as_str), Some("normal"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_status_health_requires_explorer_and_clean_tray() {
+        let healthy = ShellStatus {
+            explorer_running: true,
+            shell_window_ok: true,
+            taskbar_visible: true,
+            foreign_tray_present: false,
+            rs_desktop_present: false,
+        };
+        assert!(healthy.is_healthy());
+        assert!(!ShellStatus { taskbar_visible: false, ..healthy }.is_healthy());
+        assert!(!ShellStatus { shell_window_ok: false, ..healthy }.is_healthy());
+        assert!(!ShellStatus { foreign_tray_present: true, ..healthy }.is_healthy());
+        assert!(!ShellStatus { rs_desktop_present: true, ..healthy }.is_healthy());
+        assert!(!ShellStatus { explorer_running: false, ..healthy }.is_healthy());
     }
 }

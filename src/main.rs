@@ -10,6 +10,7 @@ extern crate winrust_common;
 use winrust_common as i18n;
 mod cli;
 mod install;
+mod layout;
 mod selection;
 mod ui;
 use {cli::*, install::*, selection::*, ui::*};
@@ -49,6 +50,7 @@ const TEXT: u32 = rgb(245, 245, 247);
 const DIM: u32 = rgb(142, 142, 147);
 const ACCENT: u32 = rgb(10, 132, 255);
 const GOOD: u32 = winrust_common::style::GOOD;
+const WARN_COL: u32 = winrust_common::style::WARN;
 const BAD: u32 = winrust_common::style::BAD;
 const WM_DONE: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported by windows-sys under the enabled features
@@ -183,6 +185,7 @@ static SELECTED: [AtomicBool; PLUGINS.len()] = [const { AtomicBool::new(false) }
 static MSG: Mutex<(String, bool)> = Mutex::new((String::new(), true));
 thread_local! { static SETTINGS: Cell<Option<usize>> = const { Cell::new(None) }; } // plugin whose settings panel is open
 thread_local! { static HOVER: Cell<Option<usize>> = const { Cell::new(None) }; }
+thread_local! { static SCROLL: Cell<f32> = const { Cell::new(0.0) }; }
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -194,22 +197,40 @@ fn main() {
         SELECTED[i].store(selected_by_default(PLUGINS[i].name, INSTALLED[i].load(Relaxed)), Relaxed);
     }
     unsafe {
+        SetProcessDPIAware();
         let (mut token, mut input): (usize, GdiplusStartupInput) = (0, zeroed());
         input.GdiplusVersion = 1;
         GdiplusStartup(&mut token, &input, null_mut());
         let hi = GetModuleHandleW(null());
         let cls = wide("WinRust");
-        let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: cls.as_ptr(), ..zeroed() };
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(proc),
+            hInstance: hi,
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            lpszClassName: cls.as_ptr(),
+            ..zeroed()
+        };
         RegisterClassW(&wc);
         let dc = GetDC(null_mut());
-        let s = GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0;
+        let s = (GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0).max(1.0);
         ReleaseDC(null_mut(), dc);
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT { left: 0, top: 0, right: (WIN_W * s) as i32, bottom: (WIN_H * s) as i32 };
+        let mut wa: RECT = zeroed();
+        if SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as _, 0) == 0 {
+            wa = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
+        }
+        let (cw_log, ch_log) = layout::initial_client_size((wa.right - wa.left) as f32 / s, (wa.bottom - wa.top) as f32 / s);
+        let style = WS_OVERLAPPEDWINDOW;
+        let mut r = RECT { left: 0, top: 0, right: (cw_log * s).round() as i32, bottom: (ch_log * s).round() as i32 };
         AdjustWindowRect(&mut r, style, 0);
+        let win_w = (r.right - r.left).min(wa.right - wa.left);
+        let win_h = (r.bottom - r.top).min(wa.bottom - wa.top);
+        let wx = wa.left + ((wa.right - wa.left - win_w) / 2).max(0);
+        let wy = wa.top + ((wa.bottom - wa.top - win_h) / 2).max(0);
         let title = wide("WinRust");
-        let hwnd = CreateWindowExW(0, cls.as_ptr(), title.as_ptr(), style | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null_mut(), null_mut(), hi, null());
+        let hwnd = CreateWindowExW(0, cls.as_ptr(), title.as_ptr(), style | WS_VISIBLE, wx, wy, win_w, win_h, null_mut(), null_mut(), hi, null());
         DwmSetWindowAttribute(hwnd, 20, &1i32 as *const i32 as *const _, 4); // dark title bar
+        DwmSetWindowAttribute(hwnd, 33, &2i32 as *const i32 as *const _, 4); // rounded corners on Win11
         DwmSetWindowAttribute(hwnd, 35, &BG as *const u32 as *const _, 4); // caption colour = window background (Win11; ignored on Win10)
         let mut m: MSG = zeroed();
         while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {

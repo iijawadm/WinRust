@@ -53,3 +53,7 @@ opt-level = 3 # MFT parsing: speed over size, as before the workspace
 [[test]]
 name = "explorer-service-settings"
 path = "src/install/explorer/dword_snapshot.rs"
+
+[[test]]
+name = "ui-layout"
+path = "src/layout.rs"

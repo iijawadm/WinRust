@@ -334,7 +334,7 @@ unsafe fn show(h: HWND, run: bool) {
     let (w, hgt, slide) = st(|s| ((W as f32 * s.scale) as i32, s.height as i32, s.slide as i32));
     SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
     SetWindowPos(h, HWND_TOPMOST, x, y + slide, w, hgt, SWP_SHOWWINDOW);
-    SetForegroundWindow(h);
+    winrust_common::fg::force(h); // a plain SetForegroundWindow may be refused: the card shows, typing goes elsewhere (#72)
     SetTimer(h, T_CARET, 530, None);
     start_anim(h);
 }

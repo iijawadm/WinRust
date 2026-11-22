@@ -87,7 +87,12 @@ pub(crate) fn bar_uninstall() -> Result<(), String> {
     let _ = run("taskkill", &["/f", "/im", "reshell.exe"]);
     let _ = run("taskkill", &["/f", "/im", "topbar.exe"]);
     let _ = profile_uninstall();
-    let r = run(bar_dir().join("topbar.exe").to_str().unwrap(), &["--restore"]); // a killed bar cannot restore the taskbar itself
+    let r = if bar_dir().join("topbar.exe").is_file() {
+        run(bar_dir().join("topbar.exe").to_str().unwrap(), &["--restore"])
+    } else {
+        Ok(())
+    };
+    i18n::recovery::unhide_explorer_taskbars();
     let _ = fs::remove_dir_all(bar_dir());
     cleaner_release(tm_dir().join("rtaskmgr-win32.exe").is_file());
     r

@@ -1630,21 +1630,21 @@ unsafe fn run_cmd(hwnd: HWND, label: &str, cmd: Cmd) {
                     Cmd::RestoreDefaults => {
                         let title = wide(t!("Восстановление настроек Windows", "Restore Windows Defaults"));
                         let body = wide(t!(
-                            "Будет создана автоматическая точка восстановления, после чего будут возвращены:\n\
+                            "Будет создана автоматическая точка восстановления, затем безопасно остановлены компоненты оболочки WinRust и возвращены:\n\
                             • стандартные ассоциации Проводника Windows (папки и диски);\n\
-                            • исходная оболочка Windows и панель задач;\n\
+                            • исходная оболочка Windows (explorer.exe) и панель задач с обязательной проверкой запуска;\n\
                             • исходная видимость значков рабочего стола (как до WinRust);\n\
                             • стандартные параметры WinRust и игровых переключателей.\n\n\
-                            Личные файлы и данные пользователей НЕ будут удалены.\n\nПродолжить?",
-                            "An automatic recovery point will be created first, then WinRust will restore:\n\
+                            Личные файлы НЕ будут удалены. Может потребоваться подтверждение UAC (для остановки topbar с правами администратора).\n\nПродолжить?",
+                            "An automatic recovery point will be created first, then WinRust will safely stop its shell components and restore:\n\
                             • Original Windows File Explorer folder/drive behavior;\n\
-                            • Original Windows shell, Winlogon values, and stock taskbar;\n\
+                            • Original Windows shell (explorer.exe), Winlogon values, and visible taskbar (verified before finishing);\n\
                             • Your original pre-WinRust desktop icon visibility;\n\
                             • WinRust settings and gaming toggles back to defaults.\n\n\
-                            No personal files or user data will be deleted.\n\nContinue?"
+                            No personal files will be deleted. Administrator (UAC) confirmation may be requested to stop elevated topbar.\n\nContinue?"
                         ));
                         if MessageBoxW(hwnd, body.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
-                            say(t!("Восстановление настроек Windows…", "Restoring Windows defaults…").into());
+                            say(t!("Безопасное восстановление и проверка оболочки Windows…", "Safely restoring and verifying Windows shell…").into());
                             std::thread::spawn(|| {
                                 let res = winrust_common::recovery::restore_windows_defaults();
                                 note(res.unwrap_or_else(|e| e));
@@ -1988,7 +1988,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 } else {
                     ShowWindow(hwnd, SW_SHOW);
                 }
-                SetForegroundWindow(hwnd);
+                winrust_common::fg::force(hwnd);
                 if wp > 0 {
                     let target = wp - 1;
                     if target < APP.with_borrow(|a| a.pages.len()) {

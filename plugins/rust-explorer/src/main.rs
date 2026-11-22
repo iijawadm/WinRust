@@ -319,7 +319,11 @@ unsafe fn activate(h: HWND, p: PathBuf, is_dir: bool) {
     else if is_dir { load(h, p) }
     else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && p.is_file() { load(h, p) } // a zip opens like a folder; "Extract here" is in its menu
     else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
-    else { unsafe { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL) }; }
+    else {
+        // like Explorer: the exe starts in its own folder (games look for files next to it)
+        let dir = p.parent().map(|d| w(&d.to_string_lossy()));
+        unsafe { ShellExecuteW(h, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), dir.as_ref().map_or(ptr::null(), |d| d.as_ptr()), SW_SHOWNORMAL) };
+    }
 }
 
 /// The menu for rows inside a zip. They are no shell items, so this is a small menu of our own.
@@ -1763,6 +1767,19 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 match nm.code {
                     NM_CUSTOMDRAW if nm.hwndFrom == list && !desk() => return ui::list_draw(lp), // the rows are painted by hand
                     LVN_ITEMCHANGED | LVN_ODSTATECHANGED => ui::status_dirty(h), // selection count in the status line
+                    // typing a letter jumps to the next row that starts with it (#81): a virtual list asks us to search
+                    LVN_ODFINDITEMW if nm.hwndFrom == list => {
+                        let f = &*(lp as *const NMLVFINDITEMW);
+                        if f.lvfi.flags & (LVFI_STRING | LVFI_PARTIAL) == 0 || f.lvfi.psz.is_null() { return -1; }
+                        let mut n = 0;
+                        while *f.lvfi.psz.add(n) != 0 { n += 1; }
+                        let q = String::from_utf16_lossy(std::slice::from_raw_parts(f.lvfi.psz, n)).to_lowercase();
+                        return ST.with_borrow(|st| {
+                            let len = st.rows.len();
+                            let start = usize::try_from(f.iStart).unwrap_or(0);
+                            (0..len).map(|k| (start + k) % len).find(|&i| !st.rows[i].hdr && st.rows[i].name.to_lowercase().starts_with(&q)).map_or(-1, |i| i as isize)
+                        });
+                    }
                     LVN_GETDISPINFOW => {
                         let it = &mut (*(lp as *mut NMLVDISPINFOW)).item;
                         // a request that arrives while ST is borrowed is skipped; the list repaints later
@@ -1958,6 +1975,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 SetFocus(list);
                 0
             }
+            // icons hidden: the list is not shown, so the click lands on the desktop itself; the menu must still open
+            WM_CONTEXTMENU if desk() && icons_hidden() => { bg_menu(h); 0 }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
             WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
@@ -1966,7 +1985,22 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
     }
 }
 
+/// Control Panel, Recycle Bin, "This PC" arrive as shell addresses (`::{GUID}`, `shell:...`), not folders: not ours to show (#85, #80, #70).
+fn namespace_target() -> Option<String> {
+    env::args().skip(1).find_map(|a| {
+        let t = a.trim_matches('"').rsplit(',').next().unwrap_or("").to_string(); // `/e,::{...}`
+        let l = t.to_lowercase();
+        (l.starts_with("::{") || l.starts_with("shell:")).then_some(t)
+    })
+}
+
 fn main() {
+    if let Some(t) = namespace_target() {
+        // control.exe opens its own window; explorer.exe given a namespace address opens it directly (no folder verb involved)
+        let panel = t.to_uppercase().contains("26EE0668-A00A-44D7-9371-BEB064C98683");
+        let _ = std::process::Command::new(if panel { "control.exe" } else { "explorer.exe" }).args(if panel { vec![] } else { vec![t] }).spawn();
+        return;
+    }
     sh::init();
     unsafe {
         SetProcessDPIAware(); // sharp text at any scaling; every size below goes through ui::sc

@@ -26,7 +26,7 @@ pub(crate) fn cli(args: &[String]) -> i32 {
     let yes = args.iter().any(|a| a == "--yes");
     let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--yes").collect();
     let find = |n: &str| PLUGINS.iter().position(|p| p.name == n);
-    let usage = "usage: plugin-launcher list | install <plugin>...|all --yes | update <plugin> | uninstall <plugin> | restore-defaults --yes | recover | rollback --yes";
+    let usage = "usage: plugin-launcher list | install <plugin>...|all --yes | update <plugin> | uninstall <plugin> | restore-defaults --yes | emergency-restore --yes | verify-shell | recover | rollback --yes";
     let result = match words.as_slice() {
         ["list"] => {
             for p in PLUGINS {
@@ -81,11 +81,16 @@ pub(crate) fn cli(args: &[String]) -> i32 {
             Some(i) if !(PLUGINS[i].installed)() => return { say(&format!("{n} is not installed")); 0 },
             Some(i) => uninstall_plugin(i),
         },
-        ["restore-defaults"] if yes => {
+        ["restore-defaults"] | ["emergency-restore"] if yes => {
             init_soft();
             i18n::recovery::restore_windows_defaults()
         }
-        ["restore-defaults"] => return { say("Restores Windows shell, File Explorer, taskbar and original desktop icon visibility. Repeat with --yes."); 2 },
+        ["restore-defaults"] | ["emergency-restore"] => return { say("Safely stops WinRust shell, restores Windows File Explorer, taskbar, Winlogon values and original desktop icon visibility, and verifies the desktop returns. Repeat with --yes."); 2 },
+        ["verify-shell"] => {
+            let st = i18n::recovery::verify_windows_shell();
+            say(&format!("Windows shell healthy: {} ({})", st.is_healthy(), st.summary()));
+            return if st.is_healthy() { 0 } else { 1 };
+        }
         ["recover"] => {
             let st = st_dir().join("rust-settings.exe");
             if st.is_file() && Command::new(&st).arg("recovery").spawn().is_ok() {
