@@ -11,7 +11,7 @@
 //! - Never deletes user personal files or assumes stock Windows defaults when a baseline exists.
 //! - Every registry query/write honors `WINRUST_SID` (`crate::reg::user_args`) when run elevated under another admin account.
 
-use crate::{gaming, proc, reg, style};
+use crate::{gaming, proc, reg, style, t, tf};
 use std::{
     collections::BTreeMap,
     fs,
