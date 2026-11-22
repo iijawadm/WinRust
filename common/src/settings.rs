@@ -166,6 +166,7 @@ fn own_page(uri: &str) -> Option<&'static str> {
         "ms-settings:bluetooth" | "ms-settings:network-airplanemode" => Some("bluetooth"),
         "ms-settings:appsfeatures" => Some("apps"),
         "ms-settings:windowsupdate" => Some("update"),
+        "ms-settings:recovery" => Some("recovery"),
         "ms-settings:about" => Some("about"),
         "ms-settings:gaming-gamemode" | "ms-settings:gaming-gamedvr" => Some("gaming"),
         _ => None,
@@ -205,6 +206,7 @@ mod tests {
         assert_eq!(own_page("ms-settings:network-wifi"), Some("network"));
         assert_eq!(own_page("ms-settings:bluetooth"), Some("bluetooth"));
         assert_eq!(own_page("ms-settings:windowsupdate"), Some("update"));
+        assert_eq!(own_page("ms-settings:recovery"), Some("recovery"));
         assert_eq!(own_page("ms-settings:gaming-gamemode"), Some("gaming"));
         assert_eq!(own_page("ms-settings:easeofaccess"), None);
         assert_eq!(own_page("ms-settings:sound; calc"), None);

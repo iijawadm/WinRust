@@ -24,11 +24,16 @@ If UAC asks for **another administrator's** password, the per-user settings (sta
 
 The installer is in English. The **Русский** button in its corner (or "WinRust apps in Русский" in the bar's right-click menu) switches every WinRust program to Russian.
 
-## Remove
+## Remove & Recovery
 
-- **Remove all** in the installer window undoes everything: Windows Search, the taskbar, Explorer and the services come back.
+- **Recovery & Restore** in **WinRust Settings** (or the Start Menu **WinRust Recovery** shortcut / taskbar gear menu):
+  1. **Undo Last Changes** — reverts the most recent WinRust setting change.
+  2. **Restore Windows Defaults** — saves an automatic recovery point and safely restores Windows File Explorer associations, Winlogon shell/AutoRestartShell, stock taskbar, and your original pre-WinRust desktop icon visibility (never deletes personal files).
+  3. **Full WinRust Uninstall** — completely removes all WinRust components, tasks, startup entries, and hooks after confirmation.
+  4. **Create Recovery Point** — saves a timestamped snapshot of WinRust and Windows settings (plus a Windows System Restore point when elevated).
+- **Standalone recovery CLI** (works even if the UI has problems): `%ProgramFiles%\WinRust\winrust-recovery.exe restore-defaults --yes`, `winrust-recovery.exe rollback --yes`, or `rust-settings.exe --undo` / `--restore-defaults --yes` / `--uninstall-all --yes`.
 - One plugin at a time: `plugin-launcher uninstall <plugin>` (see [Command line](#command-line)).
-- **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run the installer and press Remove all.
+- **If the screen is left without a taskbar or desktop:** press Ctrl+Alt+Del → Task Manager → Run new task → `explorer.exe`, then run `WinRust Recovery` or `winrust-recovery.exe rollback --yes`.
 
 On uninstall, `rust-explorer` restores the service startup values and the svchost grouping threshold saved before installation. Older installs without those backups keep their current values and report a warning.
 
@@ -42,7 +47,7 @@ On uninstall, `rust-explorer` restores the service startup values and the svchos
 | **rust-explorer** | A standalone Rust file manager with tabs, own ZIP engine (`.zip` opens like a folder), and optional desktop host | Runs independently alongside Windows File Explorer without hijacking Windows File Explorer associations or `Win+E`. Right-click the desktop to show/hide, sort, arrange, or resize desktop icons. On fresh installs, adjusts the startup settings of PcaSvc, InventorySvc, lfsvc, cbdhsvc and DoSvc, and the svchost grouping threshold, when their values can be backed up. Its own copier (several files at once on SSDs, unbuffered for big files, progress in the status line), right-click **Compress to ZIP** (all cores) / **Extract here** (ZIP and 7z), Group by date, and mouse back/forward buttons. Requires topbar |
 | **wiztree** | A disk-usage map ("WinRust Disk" in Start) | Nothing, apart from the file and a shortcut |
 | **photoview** | A fast photo viewer | Adds it to "Open with" (it does not become the default) |
-| **rust-settings** | Settings in Rust: display (resolution, refresh rate), sound (volume), power plan and drive space, per-app volume and device choice, night light, display arrangement by dragging, network adapters, Wi-Fi on every adapter (password or 802.1X), VPN and proxy, Bluetooth, apps, Windows Update, disk cleanup, theme, **Gaming** (Auto Game Mode, Win-key lock, 0.5 ms timer, Windows Game Mode, Game DVR off, raw mouse input / no acceleration, Sticky Keys Shift×5 off, unlock Ultimate Performance), about | Nothing, apart from the file and a shortcut. Win+I and the bar menus open this window instead of Windows Settings (only a few rare pages still open the system ones) |
+| **rust-settings** | Single-instance Settings in Rust: display (resolution, refresh rate), sound (volume), **Gaming** (Auto Game Mode, Win-key lock, 0.5 ms timer, Windows Game Mode, Game DVR off, raw mouse input / no acceleration, Sticky Keys Shift×5 off, unlock Ultimate Performance), power plan and drive space, per-app volume and device choice, night light, display arrangement by dragging, network adapters, Wi-Fi on every adapter (password or 802.1X), VPN and proxy, Bluetooth, apps, Windows Update, disk cleanup, theme, **Recovery & Restore** (Undo Last Changes, Restore Windows Defaults, Full WinRust Uninstall, Create Recovery Point), about | Single-instance window (re-clicking focuses the existing window); installs Start Menu shortcuts for Settings and Recovery. Win+I and the bar menus open this window instead of Windows Settings (only a few rare pages still open the system ones) |
 | **debloat** | Off: telemetry, Copilot, Recall, Start ads, Edge in the background | Services and registry policies; old values are saved and restored on uninstall. **Command line only:** `install debloat --yes` (optional groups: `updaters`, `defender`, `ntfs`, `dns`, `gaming`) |
 | **purge** | Removes the bundled junk like Tiny11 does: Clipchamp, News, Weather, Xbox overlays, Teams, Cortana, Widgets, Skype and more, plus telemetry tasks | **IRREVERSIBLE, no undo.** Apps are removed for all users and from the image; the Store, Settings, Start and runtimes stay. Run `purge.exe` first: it only lists. **Command line only:** `install purge --yes` (OneDrive/Edge: `--onedrive --edge`; keep Xbox/Game Bar for Game Pass & Ryzen X3D: `--keep-xbox`) |
 | chrome-rs | A browser | Not installable yet |

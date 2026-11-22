@@ -208,6 +208,7 @@ thread_local! {
     static SWWND: Cell<HWND> = const { Cell::new(null_mut()) }; // the Alt+Tab switcher
     static SW: RefCell<(Vec<HWND>, usize)> = const { RefCell::new((Vec::new(), 0)) }; // its windows (z-order) and selection
     static TIP: RefCell<String> = const { RefCell::new(String::new()) };
+    static TIP_VOL: Cell<Option<(i32, bool)>> = const { Cell::new(None) }; // visual volume bar OSD (level 0..=100, muted); None = text tooltip
     static PINS: RefCell<Vec<Pin>> = const { RefCell::new(Vec::new()) };
     static BTNS: RefCell<Vec<Btn>> = const { RefCell::new(Vec::new()) }; // [0] is always Start (pin None, no wins)
     static TAPPS: RefCell<Vec<TIcon>> = const { RefCell::new(Vec::new()) };
@@ -384,9 +385,19 @@ fn bar_idx() -> Vec<usize> {
     let shown = SHOWN.with_borrow(|s| s.clone());
     TAPPS.with_borrow(|t| t.iter().enumerate().filter(|(_, x)| !x.hidden && shown.as_ref().is_some_and(|s| s.contains(&x.key))).map(|(i, _)| i).collect())
 }
-/// Bar slots of the tray: the chevron plus the icons kept on the bar.
+/// True when at least one tray icon is hidden in the overflow flyout.
+fn has_overflow() -> bool {
+    !over_idx().is_empty()
+}
+
+/// Number of tray slots on the bar: pinned bar icons plus 1 for the overflow chevron ONLY when overflow icons exist.
+fn tray_slots(bar_len: usize, overflow_len: usize) -> usize {
+    bar_len + usize::from(overflow_len > 0)
+}
+
+/// Bar slots of the tray: the chevron (only when hidden icons exist) plus the icons kept on the bar.
 fn tray_count() -> usize {
-    bar_idx().len() + 1
+    tray_slots(bar_idx().len(), over_idx().len())
 }
 
 /// Indices into TAPPS of the icons only the flyout shows (everything not kept on the bar).
@@ -403,6 +414,12 @@ fn toggle_shown(key: &str) {
     }
     let _ = std::fs::write(appdata_file("topbar-tray.txt"), cur.join("\n"));
     SHOWN.set(Some(cur));
+    if !has_overflow() {
+        let w = TRAYFLY.get();
+        if !w.is_null() {
+            unsafe { ShowWindow(w, SW_HIDE) };
+        }
+    }
 }
 
 // ---------- tray overflow flyout (the chevron): every icon, click / right click work as in the real tray ----------
@@ -421,6 +438,9 @@ unsafe fn fly_toggle() {
     if IsWindowVisible(w) != 0 {
         ShowWindow(w, SW_HIDE);
         InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
+        return;
+    }
+    if !has_overflow() {
         return;
     }
     let (_, fw, fh) = fly_size();
@@ -554,23 +574,55 @@ unsafe fn tip_font() -> HFONT {
 }
 
 unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_ERASEBKGND {
+        return 1;
+    }
     if msg != WM_PAINT {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     let mut ps: PAINTSTRUCT = zeroed();
-    let dc = BeginPaint(hwnd, &mut ps);
+    let wdc = BeginPaint(hwnd, &mut ps);
     let mut r: RECT = zeroed();
     GetClientRect(hwnd, &mut r);
-    fill(dc, r, pal().line, sc(8));
-    fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(8));
-    let f = tip_font();
-    let of = SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(dc, pal().text);
-    let mut tr = RECT { left: sc(8), top: sc(5), right: r.right - sc(8), bottom: r.bottom - sc(5) };
-    TIP.with_borrow(|s| DrawTextW(dc, wide(s).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK));
-    SelectObject(dc, of);
-    DeleteObject(f);
+    let dc = CreateCompatibleDC(wdc);
+    let bmp = CreateCompatibleBitmap(wdc, r.right.max(1), r.bottom.max(1));
+    let ob = SelectObject(dc, bmp);
+    if let Some((vol, muted)) = TIP_VOL.get() {
+        // Visual volume indicator bar (no numerical percentage): speaker icon + smooth rounded progress track.
+        fill(dc, r, pal().line, sc(10));
+        fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(10));
+        let fg = CreateFontW(-sc(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, wide(icon_face()).as_ptr());
+        let of = SelectObject(dc, fg);
+        let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
+        text(dc, vg, RECT { left: sc(8), top: 0, right: sc(30), bottom: r.bottom }, if muted { BAD } else { pal().text }, DT_CENTER);
+        SelectObject(dc, of);
+        DeleteObject(fg);
+        let track_h = sc(6).max(4);
+        let ty = (r.bottom - track_h) / 2;
+        let tx0 = sc(34);
+        let tx1 = r.right - sc(12);
+        let tw = (tx1 - tx0).max(sc(10));
+        fill(dc, RECT { left: tx0, top: ty, right: tx1, bottom: ty + track_h }, mix(pal().bg, pal().text, 0.18), track_h);
+        if !muted && vol > 0 {
+            let fw = ((tw * vol.clamp(0, 100)) / 100).max(track_h);
+            fill(dc, RECT { left: tx0, top: ty, right: (tx0 + fw).min(tx1), bottom: ty + track_h }, pal().accent, track_h);
+        }
+    } else {
+        fill(dc, r, pal().line, sc(8));
+        fill(dc, RECT { left: 1, top: 1, right: r.right - 1, bottom: r.bottom - 1 }, pal().bg, sc(8));
+        let f = tip_font();
+        let of = SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, pal().text);
+        let mut tr = RECT { left: sc(8), top: sc(5), right: r.right - sc(8), bottom: r.bottom - sc(5) };
+        TIP.with_borrow(|s| DrawTextW(dc, wide(s).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK));
+        SelectObject(dc, of);
+        DeleteObject(f);
+    }
+    BitBlt(wdc, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob);
+    DeleteObject(bmp);
+    DeleteDC(dc);
     EndPaint(hwnd, &ps);
     0
 }
@@ -639,6 +691,7 @@ unsafe fn show_tip(s: String, cx: i32) {
     if s.is_empty() || tw.is_null() {
         return;
     }
+    TIP_VOL.set(None);
     let (dc, f) = (GetDC(tw), tip_font());
     let of = SelectObject(dc, f);
     let mut r = RECT { left: 0, top: 0, right: sc(280), bottom: 0 };
@@ -652,12 +705,33 @@ unsafe fn show_tip(s: String, cx: i32) {
     if vert() {
         let y = (cx - h / 2).clamp(sc(4), GetSystemMetrics(SM_CYSCREEN) - h - sc(4));
         SetWindowPos(tw, HWND_TOPMOST, side_x(w), y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(tw, null(), 1);
+        InvalidateRect(tw, null(), 0);
         return;
     }
     let x = (cx - w / 2).clamp(sc(4), GetSystemMetrics(SM_CXSCREEN) - w - sc(4));
     SetWindowPos(tw, HWND_TOPMOST, x, if at_top() { bar_h() - bar_off() + sc(6) } else { bar_top() + bar_off() - h - sc(6) }, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(tw, null(), 1);
+    InvalidateRect(tw, null(), 0);
+}
+
+/// Shows a smooth visual volume progress pill (no percentage number) above the speaker icon while scrolling.
+unsafe fn show_vol_bar(vol: i32, muted: bool, cx: i32) {
+    let tw = TIPWND.get();
+    if tw.is_null() {
+        return;
+    }
+    let was_bar = TIP_VOL.replace(Some((vol.clamp(0, 100), muted))).is_some();
+    let (w, h) = (sc(142), sc(32));
+    if !was_bar || IsWindowVisible(tw) == 0 {
+        SetWindowRgn(tw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(10), rr(10)), 1);
+    }
+    if vert() {
+        let y = (cx - h / 2).clamp(sc(4), GetSystemMetrics(SM_CYSCREEN) - h - sc(4));
+        SetWindowPos(tw, HWND_TOPMOST, side_x(w), y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        let x = (cx - w / 2).clamp(sc(4), GetSystemMetrics(SM_CXSCREEN) - w - sc(4));
+        SetWindowPos(tw, HWND_TOPMOST, x, if at_top() { bar_h() - bar_off() + sc(6) } else { bar_top() + bar_off() - h - sc(6) }, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    InvalidateRect(tw, null(), 0);
 }
 
 // ---------- Alt+Tab switcher: the open windows' icons, most recently used first, the selected one's title below ----------
@@ -763,6 +837,8 @@ unsafe extern "system" fn sw_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 unsafe fn hide_tip(bar: HWND) {
     KillTimer(bar, 2);
+    KillTimer(bar, 6);
+    TIP_VOL.set(None);
     ShowWindow(TIPWND.get(), SW_HIDE);
 }
 
@@ -1094,13 +1170,6 @@ unsafe fn load_pins() {
         let target = fix_msix_pin(&lnk, &target).unwrap_or(target);
         let icon = lnk_icon(&lnk, &target);
         PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, icon }));
-    }
-    // once: a File Explorer button for the installed file manager (the marker keeps an unpinned one gone)
-    let marker = appdata_file("topbar-explorer-pin.txt");
-    let rx = std::env::var_os("ProgramFiles").map(|pf| PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe"));
-    if let Some(rx) = rx.filter(|rx| rx.is_file() && !marker.exists()) {
-        pin_exe(&rx.to_string_lossy());
-        let _ = std::fs::write(marker, "1");
     }
 }
 
@@ -1551,11 +1620,18 @@ fn compute_x0_bw(w: i32, apps_left: i32, left_edge: i32, gap: i32, min_bw: i32, 
     (x0, bw)
 }
 
+fn sys_width_px(has_bat: bool) -> i32 {
+    if has_bat { 162 } else { 94 }
+}
+
 fn layout(w: i32) -> Layout {
     let gap = sc(4);
-    let clock = (w - sc(96), w - sc(6));
-    let sys = (clock.0 - sc(4) - sc(116 + if BAT.get().0 >= 0 { 72 } else { 0 }), clock.0 - sc(4));
-    let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
+    let clock = (w - sc(82), w - sc(6));
+    let sys_w = sc(sys_width_px(BAT.get().0 >= 0));
+    let sys = (clock.0 - sc(2) - sys_w, clock.0 - sc(2));
+    let tc = tray_count() as i32;
+    let apps_gap = if tc > 0 { sc(2) } else { 0 };
+    let apps = (sys.0 - apps_gap - sc(24) * tc, sys.0 - apps_gap);
     let n = BTNS.with_borrow(|b| b.len()) as i32 + 1; // + the search slot
     let max_bw = sc(44 + [-6, 0, 8][i18n::style::bar_size() as usize % 3]);
     let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 2).min(n);
@@ -1577,10 +1653,11 @@ unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
     }
     if x >= l.sys.0 {
         let d = x - l.sys.0;
-        return if d < sc(42) { LANG } else if d < sc(74) { WIFI_I } else if BAT.get().0 < 0 || d < sc(106) { VOL_I } else { BAT_I };
+        return if d < sc(35) { LANG } else if d < sc(64) { WIFI_I } else if BAT.get().0 < 0 || d < sc(92) { VOL_I } else { BAT_I };
     }
-    if x >= l.apps.0 {
-        return TAPP + (x - l.apps.0) / sc(24);
+    if x >= l.apps.0 && x < l.apps.1 {
+        let slot = (x - l.apps.0) / sc(24);
+        return if has_overflow() { TAPP + slot } else { TAPP + 1 + slot };
     }
     let n = BTNS.with_borrow(|b| b.len()) as i32 + 1;
     let (d, i) = (x - l.x0, (x - l.x0) / (l.bw + l.gap));
@@ -2212,7 +2289,7 @@ unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
-    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), INET.get(), EXPLORER_UP.load(Relaxed), i18n::style::left_align(), clock_texts(), lang_name()).hash(&mut h);
+    (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), HAS_WIFI.get(), HAS_ETH.get(), ETH_UP.get(), INET.get(), EXPLORER_UP.load(Relaxed), i18n::style::left_align(), has_overflow(), bar_idx().len(), clock_texts(), lang_name()).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
     h.finish()
 }
@@ -2291,46 +2368,51 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
 
     fill(dc, RECT { left: cx - sc(9), top: l.apps.0 - sc(5), right: cx + sc(9), bottom: l.apps.0 - sc(5) + 1 }, pal().line, 0);
 
-    glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
-    let turn = ease(hv(TF_KEY, IsWindowVisible(TRAYFLY.get()) != 0));
-    chevron(dc, cx, l.apps.0 + sc(12), sc(5), if left { 90.0 } else { 270.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
+    let overflow = has_overflow();
+    let off = i32::from(overflow);
+    if overflow {
+        glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
+        let turn = ease(hv(TF_KEY, IsWindowVisible(TRAYFLY.get()) != 0));
+        chevron(dc, cx, l.apps.0 + sc(12), sc(5), if left { 90.0 } else { 270.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
+    }
     SelectObject(dc, f_txt);
     let bar = bar_idx();
     TAPPS.with_borrow(|t| {
         for (k, &ix) in bar.iter().enumerate() {
-            let (i, ti) = (k + 1, &t[ix]);
-            let y = l.apps.0 + i as i32 * sc(24);
-            glow(dc, TAPP + i as i32, hot == TAPP + i as i32, cell(y, sc(24)), pal().bg, pal().hover, sc(8));
+            let ti = &t[ix];
+            let id = TAPP + 1 + k as i32;
+            let y = l.apps.0 + (k as i32 + off) * sc(24);
+            glow(dc, id, hot == id, cell(y, sc(24)), pal().bg, pal().hover, sc(8));
             if !ti.icon.is_null() {
                 DrawIconEx(dc, cx - sc(8), y + sc(4), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
             }
         }
     });
 
-    glow(dc, LANG, hot == LANG, cell(l.sys.0, sc(42)), pal().bg, pal().hover, sc(8));
-    let grp = cell(l.sys.0 + sc(44), l.sys.1 - l.sys.0 - sc(44));
+    glow(dc, LANG, hot == LANG, cell(l.sys.0, sc(34)), pal().bg, pal().hover, sc(8));
+    let grp = cell(l.sys.0 + sc(36), l.sys.1 - l.sys.0 - sc(36));
     let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
     if tg > 0.01 || pg > 0.0 {
         fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
     }
-    text(dc, &lang_name(), cell(l.sys.0, sc(42)), pal().text, DT_CENTER);
-    net_icon(dc, cx, l.sys.0 + sc(58), sc(17), f_glyph);
+    text(dc, &lang_name(), cell(l.sys.0, sc(34)), pal().text, DT_CENTER);
+    net_icon(dc, cx, l.sys.0 + sc(50), sc(17), f_glyph);
     SelectObject(dc, f_glyph);
     let (vol, muted) = VOL.get();
     let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
-    text(dc, vg, cell(l.sys.0 + sc(79), sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
+    text(dc, vg, cell(l.sys.0 + sc(67), sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
     let (pct, ac) = BAT.get();
     if pct >= 0 {
         let col = if ac { GOOD } else if pct <= 15 { BAD } else { pal().text };
         let (bw, bh) = (sc(22), sc(11));
-        let (bx, by) = (cx - bw / 2 - sc(1), l.sys.0 + sc(111));
+        let (bx, by) = (cx - bw / 2 - sc(1), l.sys.0 + sc(98));
         fill(dc, RECT { left: bx, top: by, right: bx + bw, bottom: by + bh }, col, sc(4));
         fill(dc, RECT { left: bx + sc(1), top: by + sc(1), right: bx + bw - sc(1), bottom: by + bh - sc(1) }, mix(pal().bg, pal().hover, tg), sc(3));
         let fw = ((bw - sc(4)) * pct / 100).max(sc(1));
         fill(dc, RECT { left: bx + sc(2), top: by + sc(2), right: bx + sc(2) + fw, bottom: by + bh - sc(2) }, col, sc(2));
         fill(dc, RECT { left: bx + bw + sc(1), top: by + sc(3), right: bx + bw + sc(3), bottom: by + bh - sc(3) }, col, sc(1));
         SelectObject(dc, f_small);
-        text(dc, &format!("{pct}%"), cell(l.sys.0 + sc(126), sc(18)), pal().text, DT_CENTER);
+        text(dc, &format!("{pct}%"), cell(l.sys.0 + sc(114), sc(18)), pal().text, DT_CENTER);
     }
 
     let cb = cell(l.clock.0, l.clock.1 - l.clock.0);
@@ -2453,55 +2535,57 @@ unsafe fn paint(hwnd: HWND) {
     // a hairline between the app buttons and the tray side
     fill(dc, RECT { left: l.apps.0 - sc(5), top: mid - sc(9), right: l.apps.0 - sc(5) + 1, bottom: mid + sc(9) }, pal().line, 0);
 
-    // tray apps
-    glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    let open_tf = IsWindowVisible(TRAYFLY.get()) != 0;
-    let turn = ease(hv(TF_KEY, open_tf)); // the chevron turns over as the flyout opens, and back
-    let cc = cell(l.apps.0, sc(24));
-    chevron(dc, (cc.left + cc.right) / 2, mid, sc(5), if at_top() { 180.0 } else { 0.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
+    // tray apps (overflow chevron is hidden dynamically when no hidden icons exist)
+    let overflow = has_overflow();
+    let off = i32::from(overflow);
+    if overflow {
+        glow(dc, TAPP, hot == TAPP, cell(l.apps.0, sc(24)), pal().bg, pal().hover, sc(8));
+        SelectObject(dc, f_glyph);
+        let open_tf = IsWindowVisible(TRAYFLY.get()) != 0;
+        let turn = ease(hv(TF_KEY, open_tf)); // the chevron turns over as the flyout opens, and back
+        let cc = cell(l.apps.0, sc(24));
+        chevron(dc, (cc.left + cc.right) / 2, mid, sc(5), if at_top() { 180.0 } else { 0.0 } + 180.0 * turn, mix(pal().text, pal().accent, turn));
+    }
     SelectObject(dc, f_txt);
     let bar = bar_idx();
     TAPPS.with_borrow(|t| {
         for (k, &ix) in bar.iter().enumerate() {
-            let (i, ti) = (k + 1, &t[ix]);
-            let x = l.apps.0 + i as i32 * sc(24);
-            glow(dc, TAPP + i as i32, hot == TAPP + i as i32, cell(x, sc(24)), pal().bg, pal().hover, sc(8));
+            let ti = &t[ix];
+            let id = TAPP + 1 + k as i32;
+            let x = l.apps.0 + (k as i32 + off) * sc(24);
+            glow(dc, id, hot == id, cell(x, sc(24)), pal().bg, pal().hover, sc(8));
             if !ti.icon.is_null() {
                 DrawIconEx(dc, x + sc(4), mid - sc(8), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
             }
         }
     });
 
-    // system group: language on its own, then one pill for wifi + volume + battery (like Windows 11: they open one panel)
+    // system group: compact language badge + aligned network / volume / battery pill (no dead space)
     let tb = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
-    glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
-    let grp = RECT { left: tb.left + sc(44), top, right: tb.right, bottom: bot };
+    glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(34), bottom: bot }, pal().bg, pal().hover, sc(8));
+    let grp = RECT { left: tb.left + sc(36), top, right: tb.right, bottom: bot };
     let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
     if tg > 0.01 || pg > 0.0 {
         fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
     }
-    let mut x = tb.left + sc(10);
-    text(dc, &lang_name(), cell(x, sc(34)), pal().text, DT_LEFT);
-    x += sc(42);
-    net_icon(dc, x + sc(9), mid, sc(17), f_glyph);
-    x += sc(32);
+    text(dc, &lang_name(), cell(tb.left, sc(34)), pal().text, DT_CENTER);
+    net_icon(dc, tb.left + sc(50), mid, sc(17), f_glyph);
     SelectObject(dc, f_glyph);
     let (vol, muted) = VOL.get();
     let vg = if muted || vol == 0 { "\u{E74F}" } else if vol < 34 { "\u{E993}" } else if vol < 67 { "\u{E994}" } else { "\u{E995}" };
-    text(dc, vg, cell(x, sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
-    x += sc(32);
+    text(dc, vg, cell(tb.left + sc(67), sc(22)), if muted { BAD } else { pal().text }, DT_CENTER);
     let (pct, ac) = BAT.get();
     if pct >= 0 {
+        let bx = tb.left + sc(96);
         let col = if ac { GOOD } else if pct <= 15 { BAD } else { pal().text };
         let (bw, bh, by) = (sc(22), sc(11), mid - sc(5));
-        fill(dc, RECT { left: x, top: by, right: x + bw, bottom: by + bh }, col, sc(4)); // outline
-        fill(dc, RECT { left: x + sc(1), top: by + sc(1), right: x + bw - sc(1), bottom: by + bh - sc(1) }, mix(pal().bg, pal().hover, tg), sc(3));
+        fill(dc, RECT { left: bx, top: by, right: bx + bw, bottom: by + bh }, col, sc(4)); // outline
+        fill(dc, RECT { left: bx + sc(1), top: by + sc(1), right: bx + bw - sc(1), bottom: by + bh - sc(1) }, mix(pal().bg, pal().hover, tg), sc(3));
         let fw = ((bw - sc(4)) * pct / 100).max(sc(1));
-        fill(dc, RECT { left: x + sc(2), top: by + sc(2), right: x + sc(2) + fw, bottom: by + bh - sc(2) }, col, sc(2));
-        fill(dc, RECT { left: x + bw + sc(1), top: by + sc(3), right: x + bw + sc(3), bottom: by + bh - sc(3) }, col, sc(1)); // terminal nub
+        fill(dc, RECT { left: bx + sc(2), top: by + sc(2), right: bx + sc(2) + fw, bottom: by + bh - sc(2) }, col, sc(2));
+        fill(dc, RECT { left: bx + bw + sc(1), top: by + sc(3), right: bx + bw + sc(3), bottom: by + bh - sc(3) }, col, sc(1)); // terminal nub
         SelectObject(dc, f_txt);
-        text(dc, &format!("{pct}%"), cell(x + bw + sc(8), sc(40)), pal().text, DT_LEFT);
+        text(dc, &format!("{pct}%"), cell(bx + bw + sc(6), sc(38)), pal().text, DT_LEFT);
     }
 
     // time (semibold) over the date (dimmed)
@@ -2870,35 +2954,6 @@ unsafe fn open_launcher() -> bool {
     true
 }
 
-/// When Windows Explorer (not rs-shell) hosts the desktop, sync its desktop icon list visibility too.
-unsafe fn sync_explorer_desktop_icons(hide: bool) {
-    let mut def = null_mut();
-    let pm = FindWindowW(wide("Progman").as_ptr(), wide("Program Manager").as_ptr());
-    if !pm.is_null() {
-        def = FindWindowExW(pm, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null());
-    }
-    if def.is_null() {
-        let mut ww = null_mut();
-        loop {
-            ww = FindWindowExW(null_mut(), ww, wide("WorkerW").as_ptr(), null());
-            if ww.is_null() {
-                break;
-            }
-            let d = FindWindowExW(ww, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null());
-            if !d.is_null() {
-                def = d;
-                break;
-            }
-        }
-    }
-    if !def.is_null() {
-        let lv = FindWindowExW(def, null_mut(), wide("SysListView32").as_ptr(), null());
-        if !lv.is_null() {
-            ShowWindow(lv, if hide { SW_HIDE } else { SW_SHOW });
-        }
-    }
-}
-
 /// The gear's menu: a short main page that leads to pages for the theme, the colours, the templates and the bar itself
 /// (the look is saved for the other WinRust programs too). Picking on a page keeps it open, so choices can be tried in a row.
 unsafe fn style_menu() {
@@ -2910,7 +2965,8 @@ unsafe fn style_menu() {
         fly::MItem::head(t!("Панель", "Bar")).sep(),
         fly::MItem::new(t!("Положение, размер, поведение", "Position, size, behavior")).hint("›"),
         fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")),
-        fly::MItem::new(t!("Сбросить всё по умолчанию…", "Reset everything to defaults…")).danger().sep(),
+        fly::MItem::new(t!("Восстановление и откат…", "Recovery & Restore…")).sep(),
+        fly::MItem::new(t!("Сбросить всё по умолчанию…", "Reset everything to defaults…")).danger(),
     ];
     gear_page("\u{E713}", t!("Настройки панели", "Bar settings"), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs"), items, |i| match i {
         1 => theme_page(),
@@ -2918,7 +2974,8 @@ unsafe fn style_menu() {
         3 => templates_page(),
         5 => bar_page(),
         6 => tile_windows(),
-        7 => reset_page(),
+        7 => i18n::settings::open("ms-settings:recovery"),
+        8 => reset_page(),
         _ => {}
     });
 }
@@ -2964,7 +3021,9 @@ unsafe fn theme_page() {
     }
     gear_page("\u{E790}", t!("Тема", "Theme"), t!("Готовый вид панели и окон", "A ready-made look for the bar and windows"), items, |i| {
         let Some(&s) = i.checked_sub(1).and_then(|k| i18n::style::ALL.get(k)) else { return style_menu() };
+        let old = style().name();
         i18n::style::set_style(s);
+        i18n::recovery::record_change("style", old, s.name());
         relook(false);
         theme_page();
     });
@@ -2994,21 +3053,48 @@ unsafe fn bar_page() {
     ];
     gear_page("\u{E8A1}", t!("Панель", "Bar"), t!("Где она, какого размера и как себя ведёт", "Where it sits, its size and behavior"), items, move |i| {
         match i {
-            2..=4 => st::set_side(sides[i - 2]),
-            6..=8 => st::set_bar_size((i - 6) as u8),
-            10 => st::set_autohide(!st::autohide()), // the reserved strip comes or goes with it
-            11 => st::set_align_left(!st::align_left()),
+            2..=4 => {
+                let old = st::side().name();
+                let new = sides[i - 2];
+                st::set_side(new);
+                i18n::recovery::record_change("side", old, new.name());
+            }
+            6..=8 => {
+                let old = st::bar_size();
+                let new = (i - 6) as u8;
+                st::set_bar_size(new);
+                i18n::recovery::record_change("bar_size", &old.to_string(), &new.to_string());
+            }
+            10 => {
+                let old = st::autohide();
+                st::set_autohide(!old); // the reserved strip comes or goes with it
+                i18n::recovery::record_change("autohide", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+            }
+            11 => {
+                let old = st::align_left();
+                st::set_align_left(!old);
+                i18n::recovery::record_change("align_left", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+            }
             12 => {
                 let hide = !st::hide_desktop_icons();
-                st::set_hide_desktop_icons(hide);
-                sync_explorer_desktop_icons(hide);
+                i18n::recovery::set_desktop_icons_hidden(hide);
             }
-            13 => st::set_alttab_per_monitor(!st::alttab_per_monitor()),
+            13 => {
+                let old = st::alttab_per_monitor();
+                st::set_alttab_per_monitor(!old);
+                i18n::recovery::record_change("alttab_per_monitor", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+            }
             15 => {
-                i18n::gaming::set_auto_game(!i18n::gaming::auto_game());
+                let old = i18n::gaming::auto_game();
+                i18n::gaming::set_auto_game(!old);
+                i18n::recovery::record_change("auto_game", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
                 update_game_mode(FULLSCREEN.load(Relaxed));
             }
-            16 => i18n::gaming::set_win_lock(!i18n::gaming::win_lock()),
+            16 => {
+                let old = i18n::gaming::win_lock();
+                i18n::gaming::set_win_lock(!old);
+                i18n::recovery::record_change("win_lock", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+            }
             _ => return style_menu(),
         }
         relook(matches!(i, 2..=4 | 6..=8 | 10 | 11));
@@ -3381,11 +3467,14 @@ unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
         GEAR => sc(GEAR_X.0 + GEAR_X.1 / 2),
         SEARCH => l.x0 + l.bw / 2,
         CLOCK => (l.clock.0 + l.clock.1) / 2,
-        LANG => l.sys.0 + sc(21),
-        WIFI_I => l.sys.0 + sc(58),
-        VOL_I => l.sys.0 + sc(90),
-        BAT_I => l.sys.0 + sc(130),
-        t if (TAPP..TAPP + 100).contains(&t) => l.apps.0 + (t - TAPP) * sc(24) + sc(12),
+        LANG => l.sys.0 + sc(17),
+        WIFI_I => l.sys.0 + sc(50),
+        VOL_I => l.sys.0 + sc(78),
+        BAT_I => l.sys.0 + sc(126),
+        t if (TAPP..TAPP + 100).contains(&t) => {
+            let visual_slot = if t == TAPP { 0 } else { (t - TAPP - 1) + i32::from(has_overflow()) };
+            l.apps.0 + visual_slot * sc(24) + sc(12)
+        }
         i => l.x0 + (i + 1) * (l.bw + l.gap) + l.bw / 2,
     }
 }
@@ -3473,8 +3562,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         VOLKEY => {
             if wp == 2 { toggle_mute() } else { add_volume(if wp == 0 { 4 } else { -4 }) }
             KillTimer(hwnd, 2);
-            show_tip(vol_tip(), tip_cx(&bar_layout(hwnd), VOL_I));
-            SetTimer(hwnd, 6, 1200, None);
+            if !fly::any_open() {
+                let (v, m) = VOL.get();
+                show_vol_bar(v.max(0), m, tip_cx(&bar_layout(hwnd), VOL_I));
+                SetTimer(hwnd, 6, 1200, None);
+            }
             InvalidateRect(hwnd, null(), 0);
         }
         GAME_LOCK => {
@@ -3500,6 +3592,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             hide_taskbar_if_shown();
             refresh();
+            if IsWindowVisible(TRAYFLY.get()) != 0 && !has_overflow() {
+                ShowWindow(TRAYFLY.get(), SW_HIDE);
+            }
             // repaint (GDI+, the costly part) only when something shown changed; every 10th tick anyway as a safety net
             let (last, quiet) = SIG.get();
             let s = view_sig();
@@ -3528,11 +3623,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             InvalidateRect(hwnd, null(), 0);
         }
         WM_MOUSEWHEEL => {
-            add_volume(if (wp >> 16) as i16 > 0 { 2 } else { -2 }); // wheel anywhere on the bar = volume
+            add_volume(if (wp >> 16) as i16 > 0 { 2 } else { -2 }); // wheel over volume / bar adjusts volume smoothly
             press(VOL_I); // the speaker flashes so it is clear what the wheel changed
             KillTimer(hwnd, 2);
             if !fly::any_open() {
-                show_tip(vol_tip(), tip_cx(&bar_layout(hwnd), VOL_I)); // and the level shows above it for a moment
+                let (v, m) = VOL.get();
+                show_vol_bar(v.max(0), m, tip_cx(&bar_layout(hwnd), VOL_I));
                 SetTimer(hwnd, 6, 1200, None);
             }
             InvalidateRect(hwnd, null(), 0);
@@ -3646,7 +3742,7 @@ fn main() {
         quick::refresh(); // probe Bluetooth / wireless radios early so Quick Settings hides missing hardware immediately
         thread::spawn(fly::load_apps);
         if i18n::style::hide_desktop_icons() {
-            sync_explorer_desktop_icons(true);
+            i18n::recovery::apply_desktop_icons_hidden(true);
         }
         thread::spawn(winrust_common::mem::auto_loop); // standby purge when memory runs short, switched on from the task manager's Speed page
         let hi = GetModuleHandleW(null());
@@ -3738,6 +3834,16 @@ mod tests {
         assert_eq!(x_left, 48);
         assert_eq!(bw_center, 44);
         assert_eq!(bw_left, 44);
+    }
+
+    #[test]
+    fn tray_overflow_arrow_hides_when_empty() {
+        assert_eq!(super::tray_slots(0, 0), 0);
+        assert_eq!(super::tray_slots(3, 0), 3);
+        assert_eq!(super::tray_slots(0, 1), 1);
+        assert_eq!(super::tray_slots(2, 4), 3);
+        assert_eq!(super::sys_width_px(false), 94);
+        assert_eq!(super::sys_width_px(true), 162);
     }
 
     #[test]

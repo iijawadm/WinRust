@@ -37,6 +37,7 @@ use windows_sys::Win32::{
         LibraryLoader::GetModuleHandleW,
         Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
         SystemInformation::*,
+        Threading::CreateMutexW,
     },
     UI::{HiDpi::GetDpiForSystem, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
@@ -114,6 +115,10 @@ enum Cmd {
     Check,
     Install,
     UnlockUltimate,
+    UndoLast,
+    CreateRecoveryPoint,
+    RestoreDefaults,
+    FullUninstall,
 }
 
 const CONFIRM_SECS: u32 = 15;
@@ -204,7 +209,7 @@ fn gb(bytes: u64) -> String {
 }
 
 /// Words that select each page, in the order of `pages()`.
-const PAGE_KEYS: [&[&str]; 10] = [
+const PAGE_KEYS: [&[&str]; 11] = [
     &["display"],
     &["sound"],
     &["gaming", "game"],
@@ -214,6 +219,7 @@ const PAGE_KEYS: [&[&str]; 10] = [
     &["apps"],
     &["update"],
     &["personal", "color", "theme", "taskbar"],
+    &["recovery", "restore", "revert", "backup", "uninstall"],
     &["about"],
 ];
 
@@ -439,6 +445,8 @@ const NET_PAGE: usize = 4;
 const BT_PAGE: usize = 5;
 const APPS_PAGE: usize = 6;
 const WU_PAGE: usize = 7;
+const RECOVERY_PAGE: usize = 9;
+const ABOUT_PAGE: usize = 10;
 
 fn left_align_on() -> Option<bool> {
     Some(winrust_common::style::left_align())
@@ -726,6 +734,61 @@ fn wu_rows() -> Vec<Row> {
     rows
 }
 
+fn recovery_rows() -> Vec<Row> {
+    use winrust_common::recovery as rec;
+    let head = |s: &str| Row::Header(s.into());
+    let base_status = if rec::has_baseline() {
+        t!("Сохранена (исходные настройки Windows)", "Saved (original Windows values)").to_string()
+    } else {
+        t!("Создастся автоматически перед изменениями", "Captured automatically before changes").to_string()
+    };
+    let points = rec::list_recovery_points();
+    let points_text = match points.first() {
+        Some(latest) => tf!("{} шт. ({})", "{} saved ({})", points.len(), latest),
+        None => t!("Пока нет", "None yet").to_string(),
+    };
+    let last_change = rec::last_change_summary().unwrap_or_else(|| t!("Нет записанных изменений", "No recorded changes").into());
+    let cli_status = if rec::recovery_exe_path().is_file() {
+        t!("winrust-recovery.exe готов", "winrust-recovery.exe ready").to_string()
+    } else {
+        t!("Доступно через rust-settings --restore-defaults --yes", "Available via rust-settings --restore-defaults --yes").to_string()
+    };
+    let hist_n = rec::history_count();
+    let undo_hint = if hist_n > 0 {
+        tf!("Записей: {hist_n}", "{hist_n} recorded")
+    } else {
+        t!("Нечего отменять", "Nothing to undo").to_string()
+    };
+    vec![
+        head(t!("Состояние резервных копий", "Backup Status")),
+        Row::Info(t!("Исходная конфигурация Windows", "Original Windows baseline").into(), base_status),
+        Row::Info(t!("Точки восстановления", "Recovery points").into(), points_text),
+        Row::Info(t!("Последнее изменение WinRust", "Last WinRust change").into(), last_change),
+        Row::Info(t!("Автономное восстановление", "Standalone recovery CLI").into(), cli_status),
+        head(t!("Восстановление и откат", "Recovery & Restore")),
+        Row::Item(
+            t!("1. Отменить последнее изменение", "1. Undo Last Changes").into(),
+            undo_hint,
+            Cmd::UndoLast,
+        ),
+        Row::Item(
+            t!("2. Восстановить настройки Windows по умолчанию", "2. Restore Windows Defaults").into(),
+            t!("Безопасный откат", "Safe revert").into(),
+            Cmd::RestoreDefaults,
+        ),
+        Row::Item(
+            t!("3. Полное удаление WinRust", "3. Full WinRust Uninstall").into(),
+            t!("Удалить компоненты", "Remove WinRust").into(),
+            Cmd::FullUninstall,
+        ),
+        Row::Item(
+            t!("4. Создать точку восстановления", "4. Create Recovery Point").into(),
+            t!("Сохранить снимок", "Save snapshot").into(),
+            Cmd::CreateRecoveryPoint,
+        ),
+    ]
+}
+
 /// The rows of the pages that change by themselves; the others are built once.
 fn dynamic(page: usize, apps: &mut Option<Vec<ext::App>>) -> Option<Vec<Row>> {
     match page {
@@ -737,6 +800,7 @@ fn dynamic(page: usize, apps: &mut Option<Vec<ext::App>>) -> Option<Vec<Row>> {
         BT_PAGE => Some(bt_rows()),
         APPS_PAGE => Some(apps_rows(apps.get_or_insert_with(ext::programs))),
         WU_PAGE => Some(wu_rows()),
+        RECOVERY_PAGE => Some(recovery_rows()),
         _ => None,
     }
 }
@@ -769,6 +833,10 @@ fn pages() -> Vec<Page> {
                 Row::Switch(t!("Значки панели задач слева", "Align taskbar icons to left").into(), left_align_on, Op::LeftAlign),
                 Row::Switch(t!("Скрыть значки рабочего стола", "Hide desktop icons").into(), hide_desk_icons_on, Op::HideDeskIcons),
             ],
+        },
+        Page {
+            title: t!("Восстановление", "Recovery & Restore").into(),
+            rows: recovery_rows(),
         },
         Page {
             title: t!("О системе", "About").into(),
@@ -817,7 +885,7 @@ fn theme() -> Theme {
 use winrust_common::style::rgb;
 
 /// Icon and tile colour of each page, in the order of `pages()` (the coloured squares of macOS' System Settings).
-const ICONS: [(&str, u32); 10] = [
+const ICONS: [(&str, u32); 11] = [
     ("\u{E7F4}", rgb(10, 132, 255)),
     ("\u{E767}", rgb(255, 55, 95)),
     ("\u{E7FC}", rgb(148, 82, 255)),
@@ -827,6 +895,7 @@ const ICONS: [(&str, u32); 10] = [
     ("\u{E71D}", rgb(255, 159, 10)),
     ("\u{E895}", rgb(52, 199, 89)),
     ("\u{E771}", rgb(191, 90, 242)),
+    ("\u{E777}", rgb(255, 149, 0)),
     ("\u{E946}", rgb(142, 142, 147)),
 ];
 
@@ -1366,13 +1435,42 @@ unsafe fn display_or_mute(_hwnd: HWND, op: Op) {
         }
         Op::Proxy => unsafe { open_prompt(_hwnd, Prompt::Proxy(false)) },
         Op::Pac => unsafe { open_prompt(_hwnd, Prompt::Proxy(true)) },
-        Op::AutoGame => winrust_common::gaming::set_auto_game(!winrust_common::gaming::auto_game()),
-        Op::WinLock => winrust_common::gaming::set_win_lock(!winrust_common::gaming::win_lock()),
-        Op::TimerBoost => winrust_common::gaming::set_timer_boost(!winrust_common::gaming::timer_boost()),
-        Op::RawMouse => set_raw_mouse(!raw_mouse_on().unwrap_or(false)),
-        Op::NoStickyKey => set_sticky_hotkey_off(!sticky_hotkey_off().unwrap_or(false)),
-        Op::LeftAlign => winrust_common::style::set_left_align(!winrust_common::style::left_align()),
-        Op::HideDeskIcons => winrust_common::style::set_hide_desktop_icons(!winrust_common::style::hide_desktop_icons()),
+        Op::AutoGame => {
+            let old = winrust_common::gaming::auto_game();
+            winrust_common::gaming::set_auto_game(!old);
+            winrust_common::recovery::record_change("auto_game", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+        }
+        Op::WinLock => {
+            let old = winrust_common::gaming::win_lock();
+            winrust_common::gaming::set_win_lock(!old);
+            winrust_common::recovery::record_change("win_lock", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+        }
+        Op::TimerBoost => {
+            let old = winrust_common::gaming::timer_boost();
+            winrust_common::gaming::set_timer_boost(!old);
+            winrust_common::recovery::record_change("timer_boost", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+        }
+        Op::RawMouse => {
+            let old = raw_mouse_on().unwrap_or(false);
+            set_raw_mouse(!old);
+            winrust_common::recovery::record_change("raw_mouse", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+        }
+        Op::NoStickyKey => {
+            let old_flags = sys::string(HKEY_CURRENT_USER, r"Control Panel\Accessibility\StickyKeys", "Flags").unwrap_or_else(|| "510".into());
+            let old = sticky_hotkey_off().unwrap_or(false);
+            set_sticky_hotkey_off(!old);
+            let new_flags = sys::string(HKEY_CURRENT_USER, r"Control Panel\Accessibility\StickyKeys", "Flags").unwrap_or_else(|| if !old { "506" } else { "510" }.into());
+            winrust_common::recovery::record_change("sticky_hotkey", &old_flags, &new_flags);
+        }
+        Op::LeftAlign => {
+            let old = winrust_common::style::left_align();
+            winrust_common::style::set_left_align(!old);
+            winrust_common::recovery::record_change("align_left", if old { "1" } else { "0" }, if !old { "1" } else { "0" });
+        }
+        Op::HideDeskIcons => {
+            let hide = !winrust_common::style::hide_desktop_icons();
+            winrust_common::recovery::set_desktop_icons_hidden(hide);
+        }
         _ => {}
     }
 }
@@ -1380,6 +1478,7 @@ unsafe fn display_or_mute(_hwnd: HWND, op: Op) {
 static MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 const WM_NOTE: u32 = 0x8000 + 3; // WM_APP + 3: lParam is a Box<String> for the bottom bar
 const WM_REFRESH: u32 = 0x8000 + 4; // WM_APP + 4: a thread finished, read the page again
+const WM_SETTINGS_NAV: u32 = 0x8000 + 5; // WM_APP + 5: single-instance focus + optional page navigation (wp = page + 1)
 
 /// Asks the window (from any thread) to read the page again.
 fn ping() {
@@ -1431,7 +1530,7 @@ unsafe fn goto(hwnd: HWND, i: usize) {
         match i {
             NET_PAGE => wifi::scan(),
             BT_PAGE => bt::refresh(ping),
-            2 => {
+            POWER_PAGE => {
                 if ext::TEMP_BYTES.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
                     ext::measure_temp(ping);
                 }
@@ -1513,6 +1612,60 @@ unsafe fn run_cmd(hwnd: HWND, label: &str, cmd: Cmd) {
                             say(t!("«Максимальная производительность» добавлена — выберите её в «Питание и диски»", "Ultimate Performance unlocked - pick it under 'Power & storage'").into());
                         } else {
                             say(t!("Не удалось добавить схему (powercfg)", "Could not unlock the power plan (powercfg)").into());
+                        }
+                    }
+                    Cmd::UndoLast => {
+                        match winrust_common::recovery::undo_last_change() {
+                            Ok(m) | Err(m) => say(m),
+                        }
+                    }
+                    Cmd::CreateRecoveryPoint => {
+                        say(t!("Сохранение точки восстановления…", "Creating recovery point…").into());
+                        std::thread::spawn(|| {
+                            let res = winrust_common::recovery::create_recovery_point("manual");
+                            note(res.unwrap_or_else(|e| e));
+                        });
+                    }
+                    Cmd::RestoreDefaults => {
+                        let title = wide(t!("Восстановление настроек Windows", "Restore Windows Defaults"));
+                        let body = wide(t!(
+                            "Будет создана автоматическая точка восстановления, после чего будут возвращены:\n\
+                            • стандартные ассоциации Проводника Windows (папки и диски);\n\
+                            • исходная оболочка Windows и панель задач;\n\
+                            • исходная видимость значков рабочего стола (как до WinRust);\n\
+                            • стандартные параметры WinRust и игровых переключателей.\n\n\
+                            Личные файлы и данные пользователей НЕ будут удалены.\n\nПродолжить?",
+                            "An automatic recovery point will be created first, then WinRust will restore:\n\
+                            • Original Windows File Explorer folder/drive behavior;\n\
+                            • Original Windows shell, Winlogon values, and stock taskbar;\n\
+                            • Your original pre-WinRust desktop icon visibility;\n\
+                            • WinRust settings and gaming toggles back to defaults.\n\n\
+                            No personal files or user data will be deleted.\n\nContinue?"
+                        ));
+                        if MessageBoxW(hwnd, body.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
+                            say(t!("Восстановление настроек Windows…", "Restoring Windows defaults…").into());
+                            std::thread::spawn(|| {
+                                let res = winrust_common::recovery::restore_windows_defaults();
+                                note(res.unwrap_or_else(|e| e));
+                            });
+                        }
+                    }
+                    Cmd::FullUninstall => {
+                        let title = wide(t!("Полное удаление WinRust", "Full WinRust Uninstall"));
+                        let body = wide(t!(
+                            "ВНИМАНИЕ: это действие полностью удалит все компоненты WinRust:\n\
+                            • удалит плагины, задачи планировщика, автозапуск и ярлыки WinRust;\n\
+                            • восстановит Проводник Windows, Диспетчер задач, Поиск, панель задач и значки рабочего стола.\n\n\
+                            Личные файлы и документы НЕ будут затронуты. Потребуется подтверждение UAC.\n\nУдалить WinRust полностью?",
+                            "WARNING: this will completely remove all WinRust components:\n\
+                            • Removes WinRust plugins, scheduled tasks, startup entries, shell hooks and shortcuts;\n\
+                            • Restores Windows File Explorer, Task Manager, Windows Search, stock taskbar and original desktop icon visibility.\n\n\
+                            No personal files or user data will be deleted. Administrator (UAC) confirmation is required.\n\nProceed with full uninstall?"
+                        ));
+                        if MessageBoxW(hwnd, body.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
+                            match winrust_common::recovery::launch_full_uninstall() {
+                                Ok(m) | Err(m) => say(m),
+                            }
                         }
                     }
                     Cmd::Uninstall(_) | Cmd::BtUnpair(_) => {}
@@ -1828,6 +1981,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 refresh_page(hwnd);
                 0
             }
+            WM_SETTINGS_NAV => {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_SHOW);
+                }
+                SetForegroundWindow(hwnd);
+                if wp > 0 {
+                    let target = wp - 1;
+                    if target < APP.with_borrow(|a| a.pages.len()) {
+                        goto(hwnd, target);
+                    }
+                }
+                InvalidateRect(hwnd, null(), 0);
+                0
+            }
             WM_TIMER if wp == 3 => {
                 KillTimer(hwnd, 3);
                 if let Some((ssid, ..)) = APP.with_borrow_mut(|a| a.connecting.take()) {
@@ -2022,7 +2191,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     }
                     Some(Act::Page(i)) => goto(hwnd, i),
                     Some(Act::Flip(k, n, v)) => {
+                        let old = sys::dword(HKEY_CURRENT_USER, k, n);
                         if sys::set_hkcu_dword(k, n, v) {
+                            if n == "AutoGameModeEnabled" {
+                                winrust_common::recovery::record_change("win_game_mode", &old.unwrap_or(1).to_string(), &v.to_string());
+                            } else if n == "GameDVR_Enabled" {
+                                winrust_common::recovery::record_change("game_dvr", &old.unwrap_or(1).to_string(), &v.to_string());
+                            }
                             if k == PERSONALIZE {
                                 sys::announce_theme();
                             } else if k == ext::INET {
@@ -2100,10 +2275,87 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
+/// Ensures only one Settings window is open at a time.
+/// If another instance already holds the mutex/window, focuses it (navigating to `nav_page` if provided)
+/// and returns `None` so the caller exits immediately; otherwise returns the mutex handle to keep alive.
+unsafe fn acquire_single_instance(nav_page: Option<usize>) -> Option<HANDLE> {
+    unsafe {
+        let mutex_name = wide(r"Local\WinRustSettings-single");
+        let hmutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
+        let already = !hmutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS;
+        let class = wide("WinRustSettings");
+        let mut existing = FindWindowW(class.as_ptr(), null());
+        if already && existing.is_null() {
+            // Another instance just started and is creating its window: wait briefly so we can focus it.
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                existing = FindWindowW(class.as_ptr(), null());
+                if !existing.is_null() {
+                    break;
+                }
+            }
+        }
+        if already || !existing.is_null() {
+            if !existing.is_null() {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(existing, &mut pid);
+                if pid != 0 {
+                    AllowSetForegroundWindow(pid);
+                }
+                if IsIconic(existing) != 0 {
+                    ShowWindow(existing, SW_RESTORE);
+                }
+                SetForegroundWindow(existing);
+                PostMessageW(existing, WM_SETTINGS_NAV, nav_page.map_or(0, |p| p + 1), 0);
+            }
+            if !hmutex.is_null() {
+                CloseHandle(hmutex);
+            }
+            return None;
+        }
+        Some(hmutex)
+    }
+}
+
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--nightlight") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--nightlight") {
         return ext::night_helper(); // the colour filter's background process, see ext.rs
     }
+    // Standalone CLI recovery modes (usable even if the main WinRust UI has problems).
+    let yes = args.iter().any(|a| a == "--yes");
+    match args.first().map(String::as_str) {
+        Some("--undo") => {
+            std::process::exit(if winrust_common::recovery::undo_last_change().is_ok() { 0 } else { 1 });
+        }
+        Some("--create-recovery-point") => {
+            std::process::exit(if winrust_common::recovery::create_recovery_point("cli").is_ok() { 0 } else { 1 });
+        }
+        Some("--restore-defaults") => {
+            if !yes {
+                std::process::exit(2);
+            }
+            std::process::exit(if winrust_common::recovery::restore_windows_defaults().is_ok() { 0 } else { 1 });
+        }
+        Some("--uninstall-all") => {
+            if !yes {
+                std::process::exit(2);
+            }
+            std::process::exit(if winrust_common::recovery::uninstall_all_in_process().is_ok() { 0 } else { 1 });
+        }
+        _ => {}
+    }
+    let requested = args.first().map(|a| {
+        if a.eq_ignore_ascii_case("--recover") {
+            RECOVERY_PAGE
+        } else {
+            page_for(a)
+        }
+    });
+    let _single_guard = match unsafe { acquire_single_instance(requested) } {
+        Some(h) => h,
+        None => return,
+    };
     audio::init();
     unsafe {
         let (mut token, mut input): (usize, windows_sys::Win32::Graphics::GdiPlus::GdiplusStartupInput) = (0, std::mem::zeroed());
@@ -2111,7 +2363,7 @@ fn main() {
         windows_sys::Win32::Graphics::GdiPlus::GdiplusStartup(&mut token, &input, null_mut()); // for the smooth rounded shapes
         SetProcessDPIAware();
         let dpi = GetDpiForSystem() as i32;
-        let start = std::env::args().nth(1).map_or(0, |a| page_for(&a));
+        let start = requested.unwrap_or(0);
         let (pg, lay) = (pages(), display::layout()); // read before the borrow: COM calls inside can run the window procedure
         APP.with_borrow_mut(|a| (a.pages, a.page, a.dpi, a.layout) = (pg, start, dpi, lay));
         refresh_fonts();
@@ -2161,7 +2413,11 @@ mod tests {
     #[test]
     fn every_page_has_its_keys() {
         assert_eq!(pages().len(), PAGE_KEYS.len());
+        assert_eq!(pages().len(), ICONS.len());
         assert_eq!(page_for("ms-settings:network-status"), NET_PAGE);
+        assert_eq!(page_for("ms-settings:recovery"), RECOVERY_PAGE);
+        assert_eq!(page_for("recovery"), RECOVERY_PAGE);
+        assert_eq!(page_for("restore"), RECOVERY_PAGE);
     }
 
     #[test]
@@ -2189,10 +2445,12 @@ mod tests {
         assert_eq!(os_name("Windows 10 Pro", 26100), "Windows 11 Pro");
         assert_eq!(os_name("Windows 10 Pro", 19045), "Windows 10 Pro");
         assert_eq!(gb(16 << 30), "16.0 GB");
-        assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (9, 0, 0, 0));
+        assert_eq!((page_for("ms-settings:about"), page_for("more"), page_for("ms-settings:display"), page_for("")), (ABOUT_PAGE, 0, 0, 0));
         assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 8));
         assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
         assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (POWER_PAGE, POWER_PAGE));
         assert_eq!((page_for("gaming"), page_for("ms-settings:gaming-gamemode")), (GAME_PAGE, GAME_PAGE));
+        assert_eq!((page_for("recovery"), page_for("ms-settings:recovery")), (RECOVERY_PAGE, RECOVERY_PAGE));
+        assert_eq!(ABOUT_PAGE, pages().len() - 1); // About always stays last
     }
 }

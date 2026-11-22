@@ -221,7 +221,7 @@ fn hotkey_loop() {
         while GetMessageW(&mut m, ptr::null_mut(), 0, 0) > 0 {
             match (m.message == WM_HOTKEY).then_some(m.wParam) {
                 Some(1) => winrust_common::desktop::toggle(),
-                Some(2) => { let fm = dir().join("rust-explorer.exe"); let _ = quiet(if fm.exists() { fm } else { "explorer.exe".into() }).spawn(); }
+                Some(2) => { let _ = quiet("explorer.exe").spawn(); }
                 _ => {}
             }
         }

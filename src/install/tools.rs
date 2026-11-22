@@ -46,10 +46,17 @@ pub(crate) fn tool_remove(exe: &str, dir: &Path, lnk: Option<&str>) {
 }
 
 pub(crate) fn st_install() -> Result<(), String> {
-    tool_install("rust-settings.exe", &st_dir(), Some("WinRust Settings"))
+    tool_install("rust-settings.exe", &st_dir(), Some("WinRust Settings"))?;
+    let dst = st_dir().join("rust-settings.exe");
+    soft(
+        t!("ярлык «WinRust Recovery» в меню Пуск не создан", "Start menu shortcut 'WinRust Recovery' was not created"),
+        shortcut(&start_lnk("WinRust Recovery"), &dst, "recovery"),
+    );
+    Ok(())
 }
 
 pub(crate) fn st_uninstall() -> Result<(), String> {
+    let _ = fs::remove_file(start_lnk("WinRust Recovery"));
     tool_remove("rust-settings.exe", &st_dir(), Some("WinRust Settings")); // also ends the night-light helper (same exe)
     // what the night-light switch left for the user: its autostart value and its setting
     let _ = run("reg", &["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "WinRustNightLight", "/f"]);

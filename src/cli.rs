@@ -26,7 +26,7 @@ pub(crate) fn cli(args: &[String]) -> i32 {
     let yes = args.iter().any(|a| a == "--yes");
     let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--yes").collect();
     let find = |n: &str| PLUGINS.iter().position(|p| p.name == n);
-    let usage = "usage: plugin-launcher list | install <plugin>...|all --yes | update <plugin> | uninstall <plugin> | rollback --yes";
+    let usage = "usage: plugin-launcher list | install <plugin>...|all --yes | update <plugin> | uninstall <plugin> | restore-defaults --yes | recover | rollback --yes";
     let result = match words.as_slice() {
         ["list"] => {
             for p in PLUGINS {
@@ -81,6 +81,24 @@ pub(crate) fn cli(args: &[String]) -> i32 {
             Some(i) if !(PLUGINS[i].installed)() => return { say(&format!("{n} is not installed")); 0 },
             Some(i) => uninstall_plugin(i),
         },
+        ["restore-defaults"] if yes => {
+            init_soft();
+            i18n::recovery::restore_windows_defaults()
+        }
+        ["restore-defaults"] => return { say("Restores Windows shell, File Explorer, taskbar and original desktop icon visibility. Repeat with --yes."); 2 },
+        ["recover"] => {
+            let st = st_dir().join("rust-settings.exe");
+            if st.is_file() && Command::new(&st).arg("recovery").spawn().is_ok() {
+                return { say("Opened WinRust Recovery & Restore."); 0 };
+            }
+            say(&format!("Baseline saved: {}", i18n::recovery::has_baseline()));
+            say(&format!("Recovery points: {}", i18n::recovery::list_recovery_points().len()));
+            if let Some(last) = i18n::recovery::last_change_summary() {
+                say(&format!("Last change: {last}"));
+            }
+            say("Use `restore-defaults --yes` to restore Windows defaults or `rollback --yes` for full uninstall.");
+            return 0;
+        }
         ["rollback"] if yes => rollback(),
         ["rollback"] => return { say("Removes every installed plugin. Repeat with --yes."); 2 },
         _ => return { say(usage); 2 },

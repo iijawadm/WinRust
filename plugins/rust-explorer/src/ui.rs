@@ -148,13 +148,19 @@ pub unsafe fn restyle(h: HWND) {
     unsafe extern "system" fn each(c: HWND, _: LPARAM) -> i32 {
         let mut cls = [0u16; 32];
         let n = GetClassNameW(c, cls.as_mut_ptr(), 32).max(0) as usize;
-        if String::from_utf16_lossy(&cls[..n]) == "SysListView32" {
-            style_list(c);
+        match String::from_utf16_lossy(&cls[..n]).as_str() {
+            "SysListView32" => style_list(c),
+            "EDIT" => { SendMessageW(c, WM_SETFONT, font(14, 400, ui_face()) as usize, 1); }
+            _ => {}
         }
         1
     }
     EnumChildWindows(h, Some(each), 0);
-    // the list rows' cached fonts and the title bar follow too
+    // the address box brush and list rows' cached fonts follow the new palette/font
+    let old_br = BRUSH.replace(0);
+    if old_br != 0 {
+        DeleteObject(old_br as HGDIOBJ);
+    }
     let (a, b) = FONTS.replace((0, 0));
     for f in [a, b].into_iter().filter(|&f| f != 0) {
         DeleteObject(f as HGDIOBJ);
@@ -166,12 +172,13 @@ pub unsafe fn restyle(h: HWND) {
     RedrawWindow(h, ptr::null(), ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
-/// Dark list: themed scrollbars and header, own colours and font, taller rows.
+/// Themed list: matching dark/light scrollbars and header, own colours and font, taller rows.
 pub fn style_list(list: HWND) {
     unsafe {
-        SetWindowTheme(list, w("DarkMode_Explorer").as_ptr(), ptr::null());
+        let light = winrust_common::style::style().light();
+        SetWindowTheme(list, w(if light { "Explorer" } else { "DarkMode_Explorer" }).as_ptr(), ptr::null());
         let hdr = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-        SetWindowTheme(hdr, w("DarkMode_ItemsView").as_ptr(), ptr::null());
+        SetWindowTheme(hdr, w(if light { "ItemsView" } else { "DarkMode_ItemsView" }).as_ptr(), ptr::null());
         for (m, c) in [(LVM_SETBKCOLOR, listbg()), (LVM_SETTEXTBKCOLOR, listbg()), (LVM_SETTEXTCOLOR, pal().text)] { SendMessageW(list, m, 0, c as isize); }
         SendMessageW(list, WM_SETFONT, font(14, 400, ui_face()) as usize, 1);
         row_height(list, true);
@@ -716,24 +723,12 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             InvalidateRect(h, ptr::null(), 0);
         }
         WM_CTLCOLOREDIT => {
-            // the address box: white text on the pill's colour
+            // the address box: themed text on the pill's colour
             let dc = wp as HDC;
             SetTextColor(dc, pal().text);
             SetBkColor(dc, pill());
             if BRUSH.get() == 0 { BRUSH.set(CreateSolidBrush(pill()) as isize); }
             return BRUSH.get();
-        }
-        WM_RBUTTONUP => {
-            // right click on a pinned folder: unpin it
-            if let Some(p) = nav_hit(y).and_then(nav_path).filter(|p| pins().contains(p)) {
-                let menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, 1, w("Unpin from Quick access").as_ptr());
-                let mut pt: POINT = std::mem::zeroed();
-                GetCursorPos(&mut pt);
-                let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-                DestroyMenu(menu);
-                if id == 1 { toggle_pin(&p); }
-            }
         }
         _ => return DefWindowProcW(h, m, wp, lp),
     }
@@ -937,6 +932,18 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
                 PRESS.set((5000 + i as i32, now()));
                 InvalidateRect(h, ptr::null(), 0);
                 PostMessageW(GetParent(h), WM_UI, 20, i as isize);
+            }
+        }
+        WM_RBUTTONUP => {
+            // right click on a pinned folder in the navigation pane: unpin it
+            if let Some(p) = nav_hit(y).and_then(nav_path).filter(|p| pins().contains(p)) {
+                let menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 1, w("Unpin from Quick access").as_ptr());
+                let mut pt: POINT = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+                DestroyMenu(menu);
+                if id == 1 { toggle_pin(&p); }
             }
         }
         _ => return DefWindowProcW(h, m, wp, lp),

@@ -55,6 +55,8 @@ fn add(hwnd: isize, dir: &Path, resident: bool) -> Result<()> {
 pub fn register(hwnd: isize) { let _ = add(hwnd, Path::new(&DIR.lock().unwrap().clone()), false); }
 
 /// The always-running desktop process: stand-ins for `dirs`, so "Show in folder" there opens a window on the file.
+/// Intentionally not invoked by default so Windows File Explorer remains independent for common folders.
+#[allow(dead_code)]
 pub fn register_resident(dirs: &[PathBuf]) {
     // the shell may bring this window to the front; a hidden one on its own keeps the desktop where it is
     let h = unsafe { CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, w!("STATIC"), w!(""), WS_POPUP, 0, 0, 0, 0, None, None, None, None) };

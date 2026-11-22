@@ -130,6 +130,7 @@ pub(crate) fn rx_install() -> Result<(), String> {
     if !bar_dir().join("topbar.exe").is_file() {
         return Err(t!("сначала установите topbar: без него после отключения Explorer не будет панели", "install topbar first: without it there will be no bar after Explorer is disabled").into());
     }
+    i18n::recovery::capture_baseline_once();
     // An older installation may already have applied the tweaks without saving the originals.
     let fresh = !rx_dir().join("rust-explorer.exe").is_file()
         && trim_read((RX_STATE, "AutoRestartShell"))?.is_none();
@@ -146,20 +147,9 @@ pub(crate) fn rx_install() -> Result<(), String> {
             let v = reg_dword(WINLOGON_KEY, "AutoRestartShell").unwrap_or(1);
             run("reg", &["add", RX_STATE, "/v", "AutoRestartShell", "/t", "REG_DWORD", "/d", &v.to_string(), "/f"])?;
         }
-        // folders and drives opened by other programs, the desktop, Win+R: rust-explorer. DelegateExecute is emptied on purpose:
-        // while it is set, Windows ignores the command and uses Explorer's built-in handler.
-        // Another file manager's verbs (Directory Opus, Total Commander) are exported first, once, and imported back on uninstall.
-        for (i, k) in RX_FOLDERS.iter().enumerate() {
-            let (bak, ours) = (rx_folders_bak(i), out("reg", &["query", &format!(r"{k}\command"), "/ve"]).is_ok_and(|c| c.to_lowercase().contains("rust-explorer")));
-            if !bak.is_file() && !ours && run("reg", &["query", k]).is_ok() {
-                run("reg", &["export", k, &bak.display().to_string(), "/y"])?;
-            }
-        }
-        for k in RX_FOLDERS {
-            let c = format!(r"{k}\command");
-            run("reg", &["add", &c, "/ve", "/t", "REG_SZ", "/d", &format!("\"{}\" \"%1\"", fm.display()), "/f"])?;
-            run("reg", &["add", &c, "/v", "DelegateExecute", "/t", "REG_SZ", "/d", "", "/f"])?;
-        }
+        // Keep Windows File Explorer independent: do NOT hijack HKCU Directory/Folder/Drive shell verbs,
+        // and clean up any legacy rust-explorer overrides left by earlier versions.
+        let _ = i18n::recovery::restore_explorer_associations();
         // A logon task starts the overlay right at sign-in; Explorer runs the Run key only after its own startup delay (~20 s of
         // plain Windows on screen). Limited run level: the shell side must never run elevated. Fallback: the Run key.
         let task = format!("{} Register-ScheduledTask -TaskName rs-overlay -Force -Action (New-ScheduledTaskAction -Execute '{}' -Argument '--overlay') -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $u) -Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited) -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)) | Out-Null", task_user(), sh.display());
@@ -207,6 +197,7 @@ pub(crate) fn rx_uninstall() -> Result<(), String> {
     let _ = fs::remove_file(rx_lnk());
     let _ = fs::remove_file(start_lnk("Rust Explorer"));
     let _ = fs::remove_dir_all(rx_dir());
+    i18n::recovery::restore_original_desktop_icons();
     if r.is_ok() {
         let _ = run("reg", &["delete", RX_STATE, "/f"]);
     }

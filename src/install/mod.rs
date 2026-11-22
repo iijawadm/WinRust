@@ -120,11 +120,32 @@ pub(crate) fn checkpoint() -> Result<(), String> {
     run("powershell", &["-NoProfile", "-Command", "Checkpoint-Computer -Description 'Plugin Launcher' -RestorePointType MODIFY_SETTINGS"])
 }
 
+/// Installs an independent copy of the installer as `%ProgramFiles%\WinRust\winrust-recovery.exe` so rollback and
+/// recovery remain reachable even if the user deletes the downloaded exe or WinRust's UI cannot start.
+pub(crate) fn install_recovery_tool() {
+    let dst = i18n::recovery::recovery_exe_path();
+    let Ok(cur) = env::current_exe() else { return };
+    if cur.canonicalize().ok() != dst.canonicalize().ok() {
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = put(&cur, &dst);
+    }
+    let st = st_dir().join("rust-settings.exe");
+    if st.is_file() {
+        let _ = shortcut(&start_lnk("WinRust Recovery"), &st, "recovery");
+    } else if dst.is_file() {
+        let _ = shortcut(&start_lnk("WinRust Recovery"), &dst, "");
+    }
+}
+
 // Shared by the window and the command line, so both do exactly the same thing.
 pub(crate) fn install_plugin(i: usize) -> Result<String, String> {
     let p = &PLUGINS[i];
     let (inst, uninst) = p.actions.ok_or(t!("установка недоступна", "installation is not available"))?;
     init().inspect_err(|e| log(&tf!("{}: ОШИБКА {e}", "{}: ERROR {e}", p.name)))?; // before anything is written: no user, no install
+    i18n::recovery::capture_baseline_once();
+    install_recovery_tool();
     let was = (p.installed)(); // already installed = an update: a failure must not remove the working copy
     WARN.lock().unwrap().clear();
     soft(t!("точка восстановления не создана", "restore point was not created"), checkpoint());
@@ -161,8 +182,18 @@ pub(crate) fn uninstall_plugin(i: usize) -> Result<String, String> {
 pub(crate) fn rollback() -> Result<String, String> {
     WARN.lock().unwrap().clear();
     init_soft();
+    let _ = i18n::recovery::create_recovery_point("pre-rollback");
     // reverse install order: rust-explorer (which switched Explorer off) goes before topbar, else the session is left with no panel and no shell
     let errs: Vec<String> = PLUGINS.iter().rev().filter(|p| (p.installed)()).filter_map(|p| p.actions.and_then(|a| a.1().err().map(|e| format!("{}: {e}", p.name)))).collect();
+    let _ = i18n::recovery::restore_windows_defaults();
+    let _ = fs::remove_file(start_lnk("WinRust Recovery"));
+    let rec = i18n::recovery::recovery_exe_path();
+    if env::current_exe().ok().and_then(|p| p.canonicalize().ok()) != rec.canonicalize().ok() {
+        let _ = fs::remove_file(&rec);
+        if let Some(dir) = rec.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
     let warnings = WARN.lock().unwrap().join(" | ");
     let note = if warnings.is_empty() { "" } else {
         log(&format!("rollback: {warnings}"));

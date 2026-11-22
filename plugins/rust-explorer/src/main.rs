@@ -403,7 +403,7 @@ fn icons_hidden() -> bool {
 fn set_icons_hidden(hide: bool) {
     let m = icons_marker();
     let _ = fs::remove_file(&m); // unified into winrust_common::style::hide_desktop_icons()
-    winrust_common::style::set_hide_desktop_icons(hide);
+    winrust_common::recovery::set_desktop_icons_hidden(hide);
     let list = ST.with_borrow(|st| st.list);
     if !list.is_null() {
         unsafe { ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW }) };
@@ -570,6 +570,46 @@ fn label(dir: &PathBuf) -> String {
     dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
 
+fn user_profile_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+/// Formats a clean, always-non-empty window title reflecting the current folder, drive, archive, or This PC.
+fn window_title(dir: &std::path::Path, user_profile: Option<&std::path::Path>) -> String {
+    if dir.as_os_str().is_empty() {
+        return "This PC \u{2014} Rust Explorer".into();
+    }
+    if let Some((arc, inner)) = zipx::split_zip(dir) {
+        let zip_name = arc.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| arc.to_string_lossy().into_owned());
+        return if inner.is_empty() {
+            format!("{zip_name} \u{2014} Rust Explorer")
+        } else {
+            let seg = inner.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(&inner);
+            format!("{seg} ({zip_name}) \u{2014} Rust Explorer")
+        };
+    }
+    if let Some(up) = user_profile {
+        if up.to_string_lossy().trim_end_matches('\\').eq_ignore_ascii_case(dir.to_string_lossy().trim_end_matches('\\')) {
+            return "Home \u{2014} Rust Explorer".into();
+        }
+    }
+    let loc = match dir.file_name() {
+        Some(n) if !n.is_empty() => n.to_string_lossy().into_owned(),
+        _ => {
+            let s = dir.to_string_lossy();
+            let trimmed = s.trim_end_matches(['\\', '/']);
+            if trimmed.len() == 2 && trimmed.ends_with(':') {
+                format!("Local Disk ({trimmed})")
+            } else if trimmed.is_empty() {
+                "This PC".into()
+            } else {
+                trimmed.to_string()
+            }
+        }
+    };
+    format!("{loc} \u{2014} Rust Explorer")
+}
+
 /// Rows of `dir`, folders first. Desktop mode merges the public desktop (absolute names) and hides hidden files.
 /// None = `dir` itself is unreadable.
 fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
@@ -602,7 +642,10 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
     let Some(rows) = rows_of(&dir) else { return };
-    if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
+    if !desk() {
+        let title = window_title(&dir, user_profile_dir().as_deref());
+        unsafe { SetWindowTextW(h, w(&title).as_ptr()) };
+    }
     let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
         st.dir = dir.clone(); st.rows = rows;
@@ -694,7 +737,11 @@ fn search(h: HWND, q: &str) {
     }
     let n = rows.len();
     let where_ = if !indexed_drives.is_empty() { "" } else { " in this folder" };
-    let title = if n == 0 { format!("search: {q} - nothing{where_}") } else { format!("search: {q} - {n} hits{where_}{more}") };
+    let title = if n == 0 {
+        format!("Search: {q} (no results{where_}) \u{2014} Rust Explorer")
+    } else {
+        format!("Search: {q} ({n} hits{where_}{more}) \u{2014} Rust Explorer")
+    };
     ui::set_search(Some(q.to_string()));
     unsafe { SetWindowTextW(h, w(&title).as_ptr()) };
     let list = ST.with_borrow_mut(|st| { st.rows = rows; st.list });
@@ -1949,7 +1996,7 @@ fn main() {
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
             // where it was last closed, maximized again if it was (#71); a first start gets the default size
-            let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1000), ui::sc(660), 0 as _, 0 as _, inst, ptr::null());
+            let win = CreateWindowExW(0, cls.as_ptr(), w("Rust Explorer").as_ptr(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, ui::sc(1000), ui::sc(660), 0 as _, 0 as _, inst, ptr::null());
             match saved_place() {
                 // the same API that saved it: rcNormalPosition is in work-area coordinates, which CreateWindow does not use
                 Some((max, r)) => {
@@ -2140,5 +2187,16 @@ mod search_tests {
         let winsxs = super::search_rank(r"C:\Windows\WinSxS\amd64_games\games.exe", "games");
         assert!(user_games < nested, "exact folder should rank before noisy substring");
         assert!(nested < winsxs, "user files should always rank before WinSxS");
+    }
+
+    #[test]
+    fn window_title_formats_locations_cleanly() {
+        use std::path::Path;
+        let up = Some(Path::new(r"C:\Users\Alice"));
+        assert_eq!(super::window_title(Path::new(""), up), "This PC \u{2014} Rust Explorer");
+        assert_eq!(super::window_title(Path::new(r"C:\Users\Alice"), up), "Home \u{2014} Rust Explorer");
+        assert_eq!(super::window_title(Path::new(r"C:\Users\Alice\Downloads"), up), "Downloads \u{2014} Rust Explorer");
+        assert_eq!(super::window_title(Path::new(r"C:\"), up), "Local Disk (C:) \u{2014} Rust Explorer");
+        assert_eq!(super::window_title(Path::new(r"D:\Games"), up), "Games \u{2014} Rust Explorer");
     }
 }
